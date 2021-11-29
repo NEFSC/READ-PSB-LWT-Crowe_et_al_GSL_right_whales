@@ -1,6 +1,7 @@
-This repo accompanies the following publication:
+### This repo accompanies the following publication:
 
 Crowe LM, Brown M, Corkeron PJ, Hamilton PK, Ramp C, Ratelle S, Vanderlaan ASM, Cole TVN (2021) In plane sight: a mark-recapture analysis of North Atlantic right whales in the Gulf of St. Lawrence. Endangered Species Research. https://doi.org/10.3354/esr01156
+# 
 
 ABSTRACT:
 North Atlantic right whales _Eubalaena glacialis_ are most commonly observed along
@@ -19,7 +20,6 @@ the northern and southern GSL, regions divided by a major shipping corridor. Ana
 that individuals mostly moved less than 9.1 km d−1, although rates of up to 79.8 km d−1 were also
 calculated. The GSL is currently an important habitat for 40% of this Critically Endangered species,
 which underscores how crucial protection measures are in this area.
-
-
+#
 
 This repository is a scientific product and is not official communication of the National Oceanic and Atmospheric Administration, or the United States Department of Commerce. All NOAA GitHub project code is provided on an ‘as is’ basis and the user assumes responsibility for its use. Any claims against the Department of Commerce or Department of Commerce bureaus stemming from the use of this GitHub project will be governed by all applicable Federal law. Any reference to specific commercial products, processes, or services by service mark, trademark, manufacturer, or otherwise, does not constitute or imply their endorsement, recommendation or favoring by the Department of Commerce. The Department of Commerce seal and logo, or the seal and logo of a DOC bureau, shall not be used in any manner to imply endorsement of any commercial product or activity by DOC or the United States Government.
