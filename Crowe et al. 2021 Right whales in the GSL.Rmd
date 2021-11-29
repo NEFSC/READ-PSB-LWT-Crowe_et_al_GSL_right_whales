@@ -1,0 +1,2352 @@
+---
+title: "Crowe et al. Right whales in the GSL"
+header-includes:
+- \usepackage{float}
+- \usepackage{booktabs}
+- \usepackage{textcomp}
+- \usepackage{caption}
+output:
+  pdf_document: default
+  word_document: default
+  html_document:
+    df_print: paged
+always_allow_html: yes
+---
+```{r functions, message=FALSE, warning=FALSE, echo = FALSE, results = "hide"}
+
+#####################
+## discovery curve ##
+#####################
+
+disco<-function(x){
+  
+  freqcap<-x%>%
+    distinct(Date,EGNO)%>%
+    group_by(Date,EGNO)%>%
+    tally()%>%
+    tidyr::spread(Date,n)%>%
+    dplyr::select(-EGNO)%>%
+    as.data.frame()
+  freqcap[is.na(freqcap)] <- 0 
+  desc<-Rcapture::descriptive(freqcap)
+  desc.df<-as.data.frame(desc$base.freq, row.names = FALSE)
+  desc.df<-desc.df%>%
+    mutate(date = names(freqcap),
+           survey = yday(names(freqcap)),
+           disc = cumsum(ui),
+           order = 1:nrow(desc.df),
+           year = year(date))
+  desc.df$survey<-as.factor(desc.df$survey)
+  desc.df$disc<-as.numeric(desc.df$disc)
+  
+  desc.df
+}
+
+############################################
+## Keep first dead sighting of individual ##
+############################################
+
+  deadfirst<-function(x){
+    x%>%
+      group_by(EGNO)%>%
+      arrange(DateTime)%>%
+      filter(grepl('DEAD',Behaviors))%>%
+      arrange(Date)%>%
+      slice(1)%>%
+      ungroup()
+  }
+
+######################
+## Polygon function ##
+######################
+
+polyfun<-function(x){
+
+  coord<-lapply(x, Polygon)
+  coord_<-lapply(seq_along(coord), function(i) Polygons(list(Polygon(coord[[i]], hole=as.logical(NA))), ID = names(x)[i]))
+  activedma<-SpatialPolygons(coord_)
+  ##change projection
+  activedma.sp<-activedma
+  ##declare what kind of projection they are in
+  proj4string(activedma.sp)<-CRS.latlon
+  ##change projection
+  spTransform(activedma.sp, CRS.R)
+}
+
+######################################################
+## frequency of capture for mark-recapture analysis ##
+######################################################
+
+freqcap<-function(x){
+
+  fc<-x%>%
+  distinct(Date,EGNO)%>%
+  group_by(Date,EGNO)%>%
+  tally()%>%
+  ungroup()%>%
+  tidyr::spread(Date,n)%>%
+  dplyr::select(-EGNO)%>%
+  as.data.frame()
+fc[is.na(fc)] <- 0 
+fc
+}
+
+###############
+## AIC TABLE ##
+###############
+
+#x is mra_list outputfrom mra_aic function
+JStable<-function(x){
+JSmodeltable<-data.frame(Model = c("Base",
+                                   "Time-varying probability of capture",
+                                   "Time-varying probability of entry",
+                                   "Time-varying probability of survival",
+                                   "Time-varying probability of capture and survival",
+                                   "Time-varying probability of capture and entry",
+                                   "Time-varying probability of survival and entry",
+                                   "Time-varying probability of capture, survival, and entry"
+                                   ),
+              AIC = as.vector(unlist(x$aic)))
+
+JSmodeltable<-JSmodeltable%>%
+  arrange(AIC)%>%
+  mutate("dAIC" = AIC - min(AIC))
+JSmodeltable
+}
+########
+
+```
+```{r data, message=FALSE, warning=FALSE, echo = FALSE}
+########
+
+options(kableExtra.latex.load_packages = T)
+#tidyverse
+library(dplyr);library(ggplot2);library(lubridate);library(tidyr);
+
+#analysis
+library(Rcapture);require(marked);library(raster);library(rgdal);library(adehabitatHR);
+
+#figures
+library(cowplot);library(marmap);library(maptools);library(ggpubr);library(ggrepel)
+library(ggridges);library(mapview);library(rnaturalearth);library(sf);library(viridis);
+
+#tables
+library(knitr);library(kableExtra);
+
+#maps
+#library(maps);
+#library(lwgeom);
+
+ conflicted::conflict_prefer("filter", "dplyr")
+ conflicted::conflict_prefer("group_rows", "kableExtra", "dplyr")
+ conflicted::conflict_prefer("yday", "lubridate")
+ conflicted::conflict_prefer("year", "lubridate")
+ conflicted::conflict_prefer("month", "lubridate")
+ options(tinytex.verbose = TRUE)
+ knitr::opts_chunk$set(fig.pos = 'H')
+
+###############
+## Sightings ##
+###############
+
+## NARWC import
+
+narwc1718<-read.csv('./data/Crowe data export- 2020-04-09.csv', header = T, stringsAsFactors = F)  
+narwc1516<-read.csv('./data/2015 and 2016 GSL data for Leah 2020-08-21.csv', header = T, stringsAsFactors = F)
+neacwi19<-read.csv('./data/2019 NEA-CWI data as of 2021-06-07.csv', header = T, stringsAsFactors = F)
+
+narwc<-narwc1516%>%
+  dplyr::select(-RegionCode,-SightingNote)%>%
+  bind_rows(narwc1718)%>%
+  bind_rows(neacwi19)
+
+narwc$SightingTime<-as.numeric(narwc$SightingTime)
+narwc$SightingTime<-sprintf("%04d",narwc$SightingTime)
+narwc<-narwc%>%
+  mutate(Date = ymd(paste0(SightingYear,"-",SightingMonth,"-",SightingDay)),
+         DateTime = ymd_hm(paste0(SightingYear,"-",SightingMonth,"-",SightingDay," ",SightingTime)))
+
+narwc$SightingEGNo<-as.character(narwc$SightingEGNo)
+
+tz(narwc$DateTime)<-"Canada/Atlantic"
+
+###
+## take the best EGNO, the begno
+## this replaces the SightingEGNo with the IntermatchCode if animal does not have EGNO
+###
+
+narwc_begno<-narwc%>%
+  mutate(BEGNO = case_when(
+      nchar(SightingEGNo) > 0 ~ SightingEGNo,
+      TRUE ~ IntermatchCode),
+    GenderCode = case_when(
+      GenderCode == "" ~ "X",
+      TRUE ~ GenderCode),
+    AgeClassCode = case_when(
+      AgeClassCode == "" ~ "U",
+      TRUE ~ AgeClassCode
+    ))%>%
+  dplyr::select(-IntermatchCode,-SightingEGNo)%>%
+  dplyr::rename("EGNO" = "BEGNO", "Sex" = "GenderCode")%>%
+  dplyr::select(EGNO, everything())
+
+narwc_begno$EGNO<-as.character(narwc_begno$EGNO)
+narwc_begno$SightingYear<-as.numeric(narwc_begno$SightingYear)
+narwc_begno$Age<-as.numeric(narwc_begno$Age)
+
+##################
+## add GSL 2019 ##
+##################
+
+GSL19<-read.csv('./data/NEFSC_A GSL 2019 b 2020-04-09.csv', header = T, stringsAsFactors = F)
+
+GSL19<-GSL19%>%
+  filter(SightingLetter != 'misc')%>%
+  mutate(Date = ymd(paste0(SightingYear,"-",SightingMonth,"-",SightingDay)),
+         DateTime = ymd_hms(paste0(SightingYear,"-",SightingMonth,"-",SightingDay," ",SightingTime)),
+         EGNO = case_when(
+           EGNO == 'G055' ~ '4680', #'CT03NY17'
+           EGNO == 'G056' ~ '4720', #'CT02NY17'
+           TRUE ~ EGNO))
+
+tz(GSL19$DateTime)<-"Canada/Atlantic"
+
+######################################
+### narwc 2017 & 2018 plus GSL 2019 ##
+######################################
+
+alldata<-narwc_begno%>%
+  dplyr::select(-Sex,-Age,-AgeClassCode)%>%
+  mutate(EGNO = case_when(
+           EGNO == 'CT03NY17' ~ '4680', 
+           EGNO == 'CT02NY17' ~ '4720',
+           TRUE ~ EGNO
+  ))%>%
+  bind_rows(GSL19)
+
+################
+## DEMOGRAPHY ##
+################
+
+#this adds the demo from the NARWC dataset
+dem<-narwc_begno%>%
+  dplyr::select(EGNO, SightingYear, Sex, Age, AgeClassCode)%>%
+  distinct()%>%
+  mutate(
+  age2019 = case_when(
+    AgeClassCode == 'A' ~ 'A',
+    AgeClassCode == '' ~ 'U',
+    AgeClassCode == 'U' ~ 'U',
+    Age + (2019 - SightingYear) >= 9 ~ 'A',
+    Age == 0 ~ 'C',
+    Age + (2019 - SightingYear) < 9 ~ 'J'))%>%
+  distinct()%>%
+  tidyr::pivot_wider(names_from = SightingYear, values_from = AgeClassCode)%>%
+  arrange(EGNO)%>%
+  mutate(`2019` = case_when(
+    is.na(`2019`) & age2019 == 'A' ~ age2019,
+    TRUE ~ `2019`))%>%
+  dplyr::select(-Age,-age2019)%>%
+  tidyr::pivot_longer(cols = c(`2015`,`2016`,`2017`,`2018`,`2019`), names_to = "Year", values_to = "AgeClass")%>%
+  mutate(Sex = case_when(
+    Sex == "" ~ "X",
+    TRUE ~ Sex))%>%
+  filter(!is.na(AgeClass))%>%
+  distinct()
+
+dem$Year<-as.numeric(dem$Year)
+
+################################
+## All GSL Sightings with dem ##
+################################
+
+##add in deets for animals not sighted in consortium dataset (only seen in 2019, not 2017 or 2018)
+allGSLdem<-alldata%>%
+  mutate(EGNO = case_when(
+    EGNO == "2019CalfOf2791" ~ "4991",
+    EGNO == "2019CalfOf2503" ~ "4903",
+    TRUE ~ EGNO))%>%
+  left_join(dem, by = c("EGNO", "SightingYear" = "Year"))%>%
+  mutate(
+  AgeClass = case_when(
+    grepl("2019CalfOf",EGNO) | EGNO == "4903" | EGNO == "4991" ~ "C",
+    EGNO == 1227 ~ 'A',
+    EGNO == 3020 ~ 'A', 
+    EGNO == 3701 ~ 'A',
+    EGNO == 3730 ~ 'A',
+    EGNO == 3845 ~ 'A',
+    EGNO == 3912 & SightingYear == 2017 ~ 'J',
+    EGNO == 3912 & SightingYear >= 2018 ~ 'A',
+    EGNO == 1701 ~ 'A',
+    EGNO == 4680 ~ 'J',
+    EGNO == 4720 ~ 'U',
+    TRUE ~ AgeClass),
+  Sex = case_when(
+    EGNO == "2019CalfOf4180" ~ "F",
+    EGNO == "2019CalfOf3317" ~ "F",
+    EGNO == "4991" ~ "F", #2019CalfOf2791
+    EGNO == "4903" ~ "M", #2019CalfOf2503
+    EGNO == 1227 ~ 'M',
+    EGNO == 3020 ~ 'F', 
+    EGNO == 3701 ~ 'M',
+    EGNO == 3730 ~ 'F',
+    EGNO == 3845 ~ 'M',
+    EGNO == 3912 ~ 'F',
+    EGNO == 1701 ~ 'F',
+    EGNO == 4680 ~ 'M',
+    EGNO == 4720 ~ 'X',
+    TRUE ~ Sex))%>%
+  distinct()
+
+allGSLdem$Sex<-as.factor(allGSLdem$Sex)
+allGSLdem$AgeClass<-as.factor(allGSLdem$AgeClass)
+allGSLdem$AgeClass<-factor(allGSLdem$AgeClass, levels = c("A","J","U","C"))
+
+### allGSLdem = all photoed sightings
+allGSLdem<-allGSLdem%>%
+  mutate(ObserverCode = case_when(
+    ObserverCode == 'CCG/T' ~ 'CCG',
+    ObserverCode == 'DFO' ~ 'DFO Gulf Region',
+    ObserverCode == 'DFO/CP' ~ 'DFO BIO/C & P',
+    ObserverCode == 'DFO/CP/S' ~ 'DFO Gulf Region/C & P',
+    ObserverCode == 'DFO/NAFC/A' | ObserverCode == 'DFO/NAFC/L' ~ 'DFO NW Atl Fisheries Center',
+    ObserverCode == 'DFO/T' ~ 'DFO Gulf Region',
+    grepl('MICS',ObserverCode) ~ 'MICS',
+    TRUE ~ ObserverCode))%>%
+  mutate(pos = case_when(Latitude == 0 ~ 'E', TRUE ~ 'A'))%>% #add variable for estimated positions vs actual. a few MICS sightings had GPS issues, so while they are northern GSL sightings, their position is noted here as estimated
+  mutate(Latitude = case_when(Latitude == 0 ~ 50, TRUE ~ Latitude),
+         Longitude = case_when(Longitude == 0 ~ -64.8, TRUE ~ Longitude))%>%
+  filter(!((Longitude > -60.4 & Latitude < 47.1) & !grepl('DEAD', Behaviors)))%>%
+  group_by(SightingMonth)%>%
+  mutate(days_per_month = n_distinct(Date))%>%
+  group_by(SightingYear)%>%
+  mutate(days_per_year = n_distinct(Date))%>%
+  ungroup()
+
+######################################
+## GSLdem = all but first occasion of dead sighting, and keep first sighting per day
+GSLdem_notdead<-allGSLdem%>%
+  filter(!grepl('DEAD',Behaviors))%>%
+  filter(EGNO != "" & EGNO != 'UNMA')%>%
+  group_by(EGNO,Date)%>%
+  arrange(EGNO,DateTime)%>%
+  slice(1)%>%
+  as.data.frame()
+
+#keeping only first occasion of dead sighting
+GSLdem_deadkeep<-deadfirst(allGSLdem)
+
+#stitch it back together
+#GSLdem is all sightings FROM ALL DATA (MRAS + NARWC), but only the first occasion for animals sighted dead if they were identified
+GSLdem<-GSLdem_deadkeep%>%
+  filter(EGNO != 'D-M20170094' & EGNO != 'D-MARS2017-145' & !grepl('UKDEAD',EGNO) & EGNO != 'D-2015-07-09')%>%
+  bind_rows(GSLdem_notdead)
+
+######################################
+#Only MRAS surveys from GSLdem
+MRAS_GSLdem<-GSLdem%>%
+  filter(ObserverCode == 'NEFSC/T')
+
+#Only not MRAS from GSLdem
+notMRAS_GSLdem<-GSLdem%>%
+  filter(ObserverCode != 'NEFSC/T')
+
+########################################
+## these filters are run here to keep first occasion of dead animals within the dataset to estimate undetected, and treat MRAS independently
+###
+
+# Only MRAS surveys
+allMRASdem<-allGSLdem%>%
+  filter(ObserverCode == 'NEFSC/T')%>%
+  group_by(EGNO,Date)%>%
+  arrange(EGNO,DateTime)%>%
+  slice(1)%>%
+  ungroup()
+
+# ##remove all but first occasion of dead sighting
+allMRASdem_notdead<-allMRASdem%>%
+  filter(!grepl('DEAD',Behaviors))
+
+# #keeping only first occasion of dead sighting
+allMRASdem_deadkeep<-deadfirst(allMRASdem)
+
+#stitch it back together
+MRASdem<-allMRASdem_notdead%>%
+  bind_rows(allMRASdem_deadkeep)%>%
+  filter(EGNO != "")  
+
+```
+```{r effort, message=FALSE, warning=FALSE, echo = FALSE}
+
+## MRAS ##
+MRASsig<-allGSLdem%>% #use allGSLdem so that all sightings are counted including multiple sightings of same indivdual in a day 9/2/20
+  filter(ObserverCode == 'NEFSC/T')%>%
+  group_by(SightingYear)%>%
+  tally()%>%
+  dplyr::rename("Sightings" = "n")
+
+MRASeff<-allGSLdem%>%
+  filter(ObserverCode == 'NEFSC/T')%>%
+  distinct(Date,SightingYear)%>%
+  group_by(SightingYear)%>%
+  summarise(`Survey Days` = n(), First=min(Date),Last=max(Date))%>%
+  left_join(MRASsig, by = "SightingYear")%>%
+  as.data.frame()
+
+MRASeff$First<-format(MRASeff$First,"%d %b")
+MRASeff$Last<-format(MRASeff$Last,"%d %b")
+
+## ALL DATA ##
+ALLDATAsig<-allGSLdem%>% #use allGSLdem so that all sightings are counted including multiple sightings of same individual in a day 9/2/20
+  group_by(SightingYear)%>%
+  tally()%>%
+  dplyr::rename("Sightings" = "n")
+
+ALLDATAeff<-allGSLdem%>%
+  distinct(Date,SightingYear)%>%
+  group_by(SightingYear)%>%
+  summarise(`Sighting Days` = n(), First=min(Date),Last=max(Date))%>%
+  left_join(ALLDATAsig, by = "SightingYear")%>%
+  as.data.frame()
+
+ALLDATAeff$First<-format(ALLDATAeff$First,"%d %b")
+ALLDATAeff$Last<-format(ALLDATAeff$Last,"%d %b")
+  
+```
+```{r map, echo=FALSE, warning=FALSE, message=FALSE}
+##Repurposed map components 
+
+CRS.latlon<-CRS("+init=epsg:4269 +proj=longlat +ellps=GRS80 +datum=NAD83 +no_defs +towgs84=0,0,0")
+CRS.R<-CRS("+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0")
+CRS.utm<-CRS("+proj=utm +zone=20 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+CRS.new<-CRS("+proj=utm +zone=20 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0")
+
+# SHIPPING LANES 
+ship<-rgdal::readOGR("./shapefiles", layer = "shippinglane", verbose = FALSE)
+
+load("./shapefiles/tss.rda")
+ship.tr<-spTransform(ship, CRS.new)
+ship.sp<-spTransform(ship.tr,CRS.latlon)
+
+# LAND
+provinces<-raster::getData(country="Canada", level=1)
+GSL_provinces<-fortify(subset(provinces, (NAME_1 == "New Brunswick" | NAME_1 == "Québec" | NAME_1 == "Prince Edward Island" | NAME_1 == "Nova Scotia" | NAME_1 == "Newfoundland and Labrador" | NAME_1 == "Ontario")))
+
+US<-raster::getData(country="US", level =1)
+USeast<-fortify(US)%>%filter(long >= -90)
+
+# SEA
+bathy = marmap::getNOAA.bathy(-70, -40, 45, 55, res = 1, keep = T)
+lon = rownames(bathy) %>% as.numeric
+lat = colnames(bathy) %>% as.numeric
+
+iso200 = ContourLines2SLDF(contourLines(lon, lat, bathy, level = -200))
+iso100 = ContourLines2SLDF(contourLines(lon, lat, bathy, level = -100))
+iso50 = ContourLines2SLDF(contourLines(lon, lat, bathy, level = -50))
+
+###################
+## Fig. 1A
+###################
+
+## Critical Habitat
+###########
+
+USCH<-rgdal::readOGR("./shapefiles", layer = "shapefile_North_Atlantic_right_whale_critical_habitat_GARFO_SERO", verbose = FALSE)
+CACH<-rgdal::readOGR("./shapefiles", layer = "NARW_Critical_Habitat", verbose = FALSE)
+
+## Range 
+###########
+#from IUCN
+rwrange<-rgdal::readOGR("./shapefiles", layer = "data_0", verbose = FALSE)
+
+## Globe
+ortho<-"+proj=ortho +lat_0=46 +lon_0=-50"
+world<-rnaturalearth::ne_countries(scale = 'small', returnclass = 'sf')
+lakes<-rgdal::readOGR("./shapefiles", layer = "lakes", verbose = FALSE) 
+lakes.sp<-spTransform(lakes, ortho)
+
+world<-sf::st_cast(world, 'MULTILINESTRING') %>%
+  st_cast('LINESTRING', do_split=TRUE) %>%
+  mutate(npts = mapview::npts(geometry, by_feature = TRUE)) %>%
+  st_cast('POLYGON')
+
+rwrange.tr<-spTransform(rwrange, CRS.latlon)
+rwrange.sp<-spTransform(rwrange.tr, ortho)
+
+circle <- st_point(x = c(0,0)) %>% st_buffer(dist = 6371000) %>% st_sfc(crs = ortho)
+###########
+rw_world<-ggplot()+
+  theme_void()+
+  geom_sf(data = circle, fill = 'white')+
+  geom_polygon(data = fortify(rwrange.sp), aes(x = long, y = lat, group = group), fill = "grey", color = "grey50", size = 0.25, alpha =0.5)+
+  geom_sf(data = world, fill = "antiquewhite", color = "grey50", size = 0.25) +
+  geom_polygon(data = fortify(lakes.sp), aes(x = long, y = lat, group = group), fill = "white", color = "grey50", size = 0.25)+
+  coord_sf(crs= ortho)
+
+ggsave("./Figures/world.jpg",rw_world)
+
+bathyfull = marmap::getNOAA.bathy(-90, -40, 20, 55, res = 1, keep = T)
+lon = rownames(bathyfull) %>% as.numeric
+lat = colnames(bathyfull) %>% as.numeric
+
+alliso200 = ContourLines2SLDF(contourLines(lon, lat, bathyfull, level = -200))
+
+wna_fill = c("Range" = "grey", "CH, Canada" = "#de2d26", "CH, USA" = "#fc9272")
+
+CHlabels = data.frame(CH = c("Southeastern US\nCalving Area", "Northeastern US\nForaging Area","Grand Manan\nBasin", "Roseway\nBasin", "St. Lawrence\nSeaway", "Great Lakes"),
+                     lon = c(-81,-69,-66.45,-65.5,-76,-83),
+                     lat = c(31.5,43,44.65,42.95,45.5,45))
+
+rw_nwa<-ggplot()+
+  geom_polygon(data = fortify(rwrange), aes(x = long, y = lat, group = group, fill = "Range"), color = "grey50", size = 0.25, alpha =0.4)+
+  annotation_map(map_data("world"), fill = "antiquewhite", color = "grey50", size = 0.25)+
+  coord_sf(xlim = c(-88,-52), ylim = c(24.5,52), crs = 4269)+
+  geom_rect(mapping = aes(ymin=45.5, ymax=52, xmin=-70, xmax=-55), color = "black", fill = NA, size = 0.5, alpha = 0.7)+
+  geom_path(fortify(alliso200), mapping = aes(long,lat,group = group), color = "steelblue", alpha = 0.7, size = 0.25)+
+  geom_polygon(data = fortify(USCH), aes(x = long, y = lat, group = group, fill = "CH, USA"), color = "grey50", size = 0.25, alpha =0.8)+
+  geom_polygon(data = fortify(CACH), aes(x = long, y = lat, group = group, fill = "CH, Canada"), color = "grey50", size = 0.25, alpha =0.8)+
+  geom_polygon(data = fortify(lakes), aes(x = long, y = lat, group = group), fill = "lightblue", color = "grey50", size = 0.25, alpha = 0.7)+
+  geom_polygon(mapping = aes(x = c(-80.5,-72.85,-72.45,-80.1), y = c(43.45,46.65,45.0,41.80), group = 1), color = "black", fill = NA, size = 0.5, alpha = 0.7, linetype = "dotted")+
+  theme_bw()+
+  ylab("Latitude")+
+  xlab("Longitude")+
+  scale_fill_manual(values = wna_fill)+
+  theme(legend.title = element_blank(),
+        legend.position="right",
+        legend.text = element_text(size = 6),
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7),
+        legend.key.size = unit(0.7, "line"))+
+  annotate(geom = "text", x = -88, y = 52, label = "A", 
+           color = "black", size = 5, fontface="bold")+
+  geom_text_repel(data = CHlabels, aes(x = lon, y = lat, label = CH), size = 2, min.segment.length = 0, nudge_x = c(6.5,2,10,4,0,-1), nudge_y = c(0,-5,-2,-1,3,5))
+
+ggsave("./Figures/NWatlantic.jpg",rw_nwa, dpi = 320, width = 84, units = 'mm')
+
+range<-cowplot::ggdraw() +
+  cowplot::draw_plot(rw_nwa) +
+  cowplot::draw_plot(rw_world, x = 0.71, y = 0.27, width = 0.3, height = 0.3)
+
+ggsave("./Figures/Fig1A.svg",range, dpi = 320, width = 84.5, height = 100, units = 'mm')
+
+########################
+## Fig. 1B ##
+########################
+
+top<-as(extent( -64,-59.9,47.35,49), 'SpatialLines')
+iso200SGSL <- crop(iso200, top)
+
+topfil<-fortify(iso200SGSL)%>%filter(lat > 48.7 & long > -63)
+
+iso200SGSL<-fortify(iso200SGSL)%>%
+  anti_join(topfil)%>%
+  dplyr::select(long,lat,order)
+
+SGSLbottom<-data.frame(lat = c(47.04,46.89,46.8,45.62,45.5,45.9,48.2),
+                       long = c(-60.39,-60.64,-60.5,-61.4,-63,-64,-67.3),
+                       order = c(480,479,478,477,476,475,474))
+
+NGSLbottom<-data.frame(lat = c(47.70,47.42,47.58,48,51.2,51.63,52.27,51.6,50,47.05,46.94),
+                       long = c(-59.96,-59.53,-59.19,-58,-56.6,-55.43,-55.55,-57.1,-69.2,-70.78,-70.71),
+                       order = c(480,479,478,477,476,475,474,473,472,471,470))
+
+SGSL<-iso200SGSL%>%
+  bind_rows(SGSLbottom)%>%
+  arrange(order)%>%
+  mutate(GSL = 'S')
+
+NGSL<-iso200SGSL%>%
+  bind_rows(NGSLbottom)%>%
+  arrange(order)%>%
+  mutate(GSL = 'N')
+
+NS_GSL<-NGSL%>%
+  bind_rows(SGSL)
+
+s = 5
+gsl_fill = c("Northern GSL" = "mediumvioletred", "Southern GSL" = "green")
+
+base<-ggplot()+
+  geom_polygon(NGSL, mapping = aes(x = long, y = lat, fill = "Northern GSL"), alpha = 0.1)+
+  geom_polygon(SGSL, mapping = aes(x = long, y = lat, fill = "Southern GSL"), alpha = 0.2)+
+  geom_path(fortify(iso50), mapping = aes(long,lat,group = group), color = "steelblue2", alpha = 0.7, size = 0.2)+
+  geom_path(fortify(iso100), mapping = aes(long,lat,group = group), color = "steelblue2", alpha = 0.7, size = 0.25)+
+  geom_path(fortify(iso200), mapping = aes(long,lat,group = group), color = "steelblue", alpha = 0.7, size = 0.25)+
+  geom_polygon(GSL_provinces, mapping = aes(long,lat,group = group), fill = "antiquewhite", color = "grey50", size = 0.2)+
+  geom_polygon(USeast, mapping = aes(long,lat,group = group), fill = "antiquewhite", color = "grey50", size = 0.2)+
+  geom_path(data = fortify(ship.sp), aes(x = long, y = lat, group = group), color = "peachpuff4", size = 0.25)+
+  geom_polygon(data = tss_polygons, aes(x = lon, y = lat), fill = "peachpuff4", color = "peachpuff4", size = 0.25, alpha = 0.5)+
+  coord_sf(xlim = c(-70.5,-55.75), ylim = c(45.5,52), crs = 4269)+
+  theme_bw()+
+  ylab("Latitude")+
+  xlab("Longitude")+
+  annotate(geom = "text", x = -63, y = 49.5, label = "Anticosti",
+           color = "grey22", angle = -22, size = 2.5)+
+  annotate(geom = "text", x = -65.3, y = 48.7, label = "Gaspé\nPeninsula", 
+           color = "grey22", angle = 0, size = 2.5)+
+  geom_rect(mapping = aes(ymin = 45.8, ymax = 46.35, xmin = -61.2, xmax = -60.1), fill = 'white', alpha = 0.6)+
+  annotate(geom = "text", x = -60.7, y = 46.1, label = "Cape\nBreton",
+           color = "grey22", angle = 0, size = 2.5)+
+  annotate(geom = "text", x = -56.5, y = 48.5, label = "NEWFOUNDLAND",
+           color = "grey22", angle = 0, size = 2)+
+  annotate(geom = "text", x = -62.1, y = 48.68, label = "Laurentian\nChannel",
+           color = "grey22", angle = -15, size = 2.5, fontface="italic", family="serif")+
+  annotate(geom = "text", x = -66.5, y = 49.5, label = "1", 
+           color = "grey22", size = 4, fontface="bold")+
+  annotate(geom = "text", x = -63.8, y = 50.08, label = "2", 
+           color = "grey22", size = 4, fontface="bold")+
+  annotate(geom = "text", x = -63.4, y = 49.08, label = "3", 
+           color = "grey22", size = 4, fontface="bold")+
+  annotate(geom = "text", x = -58.7, y = 50.3, label = "4", 
+           color = "grey22", size = 4, fontface="bold")+
+  annotate(geom = "text", x = -60.1, y = 47.6, label = "5", 
+           color = "grey22", size = 4, fontface="bold")+
+  annotate(geom = "text", x = -70.9, y = 52, label = "B", 
+           color = "black", size = 5, fontface="bold")+
+  scale_fill_manual(values = gsl_fill)+
+  theme(legend.title = element_blank(),legend.position="right",
+        legend.text = element_text(size =8),
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7),
+        legend.key.size = unit(0.7, "line"))
+
+ggsave("./Figures/Fig1B.svg",base, dpi = 320, width = 135, height = 100, units = 'mm')
+
+```
+```{r demo, echo = FALSE, warning = FALSE, message = FALSE}
+###################
+## Demo breakdown ##
+###################
+
+## MRAS
+idperyear<-MRASdem%>%
+  distinct(SightingYear,EGNO)%>%
+  group_by(SightingYear)%>%
+  summarise(count = n())
+
+## count by NARWC not MRAS
+nidperyear<-notMRAS_GSLdem%>%
+  anti_join(MRASdem, by = c("EGNO","SightingYear"))%>%
+  distinct(SightingYear,EGNO)%>%
+  group_by(SightingYear)%>%
+  summarise(count = n())
+
+## all data together total age-sex (dem) breakdown
+########################################
+## unique per year
+gidperyear<-GSLdem%>%
+  distinct(SightingYear,EGNO)%>%
+  group_by(SightingYear)%>%
+  summarise(count = n())
+
+GSLdem_year<-split(GSLdem, GSLdem$SightingYear)
+
+GSLdemotable<-lapply(GSLdem_year, function(x){
+
+  table<-x%>%
+    distinct(EGNO,AgeClass,Sex)%>%
+    group_by(AgeClass,Sex)%>%
+    summarise(Count = n())%>%
+    ungroup()%>%
+    mutate(perc = paste0(round(Count/sum(Count)*100,0),'%'),`Count; %` = paste0(Count," (",perc,")"))%>%
+    dplyr::select(-perc, -Count)%>%
+    spread(Sex,`Count; %`)%>%
+    as.data.frame()
+
+  table[is.na(table)] <- 0
+  table
+})
+
+##########################################################
+#catalog proportions from 2019
+catalogdf<-data.frame(AgeClass = c("A","J","U"),
+                      `F` = c("144 (31%)", "30 (7%)","1 (< 1%)"),
+                      `M` = c("230 (50%)", "29 (6%)","0"),
+                      `X` = c("14 (3%)", "3 (1%)","7 (2%)"))
+
+demotable_all<- dplyr::bind_rows(GSLdemotable)%>%
+  bind_rows(catalogdf)%>%
+  dplyr::select(AgeClass, M, F, X)
+
+demotable_all[is.na(demotable_all)] <- 0
+
+#############
+## TABLE 1 ##
+#############
+
+MRAS_tab1<-MRASeff%>%
+  left_join(idperyear, by = "SightingYear")%>%
+  dplyr::rename("Individuals" = "count", 'Sighting Days' = 'Survey Days')%>%
+  mutate(Dataset = "MRAS")
+
+ALLDATA_tab1<-ALLDATAeff%>%
+  left_join(gidperyear, by = "SightingYear")%>%
+  dplyr::rename("Individuals" = "count")%>%
+  mutate(Dataset = "All data")
+
+tab1<-MRAS_tab1%>%
+  bind_rows(ALLDATA_tab1)%>%
+  dplyr::select(SightingYear, Dataset,`Sighting Days`, First, Last, Sightings, Individuals)%>%
+  arrange(SightingYear, Dataset)
+
+othertab1=data.frame( MC= c('3/17 (18\\%)','6/14 (43\\%)', '0/5', '0/0', '4/7 (57\\%)'),
+                      PC = c(6, 0, 0, 4, 6),
+                      RC = c(4,9,37,35,30),
+                     Dataset = 'All data',
+                     SightingYear = c(2015:2019))
+
+othertab1$MC<-as.character(othertab1$MC)
+
+#############
+
+tab1<-tab1 %>% 
+  left_join(othertab1, by = c('SightingYear','Dataset'))%>%
+  arrange(SightingYear,desc(Dataset))%>%
+  dplyr::rename(`With calves` = 'MC', `Resting` = 'RC', `Pregnant` = 'PC')%>%
+  dplyr::select(-SightingYear)
+
+tab1[is.na(tab1)] <- ''
+tab1[tab1 == 'NA'] <- ''
+
+```
+```{r disco, echo = FALSE, message=FALSE, warning=FALSE}
+#####################
+## ALL Discovery DATA ##
+#####################
+
+## MRAS data 
+MRASdisco<-disco(MRASdem)
+
+MRAS1718max<-MRASdisco%>%
+  filter(year != 2019)%>%
+  dplyr::summarise(max = max(disc))
+
+## All data
+ALLDATAdisco<-disco(GSLdem)
+ALLDATAdisco$year<-as.factor(ALLDATAdisco$year)
+
+ndy<-ALLDATAdisco%>%
+  group_by(year)%>%
+  slice(1, n())
+
+ndm<-ALLDATAdisco%>%
+  group_by(year, lubridate::month(date))%>%
+  slice(1)
+
+#####################
+
+disco_allyears<-ggplot()+
+  geom_rect(aes(xmin = ndy$order[1], xmax = ndy$order[2], ymin = -Inf, ymax = Inf, fill = '2015'), alpha = 0.4)+
+  geom_rect(aes(xmin = ndy$order[3], xmax = ndy$order[4], ymin = -Inf, ymax = Inf, fill = '2016'), alpha = 0.4)+
+  geom_rect(aes(xmin = ndy$order[5], xmax = ndy$order[6], ymin = -Inf, ymax = Inf, fill = '2017'), alpha = 0.4)+
+  geom_rect(aes(xmin = ndy$order[7], xmax = ndy$order[8], ymin = -Inf, ymax = Inf, fill = '2018'), alpha = 0.4)+
+  geom_rect(aes(xmin = ndy$order[9], xmax = ndy$order[10], ymin = -Inf, ymax = Inf, fill = '2019'), alpha = 0.4)+
+  geom_path(aes(x=interaction(ALLDATAdisco$survey,ALLDATAdisco$date), y = ALLDATAdisco$disc, colour = "All data"), group = 1, size = 1, alpha = 0.8)+
+  geom_path(aes(x=interaction(MRASdisco$survey,MRASdisco$date), y = MRASdisco$disc, colour = "MRAS"), group = 1, size = 1, alpha = 0.6)+
+  geom_point(aes(x=interaction(MRASdisco$survey,MRASdisco$date), y = MRASdisco$disc), colour = "black", size = 1.5)+
+  theme_bw()+
+  scale_fill_viridis_d(option = "plasma", name = '')+
+  xlab("Cumulative effort by day")+
+  ylab("Individuals")+
+  ylim(c(0,200))+
+  scale_x_discrete(breaks = interaction(ndm$year), guide = guide_axis(n.dodge=2))+
+  scale_colour_manual(name="",values = c(MRAS="black", `All data`="red"))+
+  guides(colour = guide_legend(order = 1), fill = guide_legend(order = 2))+
+    theme(panel.grid.minor = element_blank(),
+        legend.position="bottom",
+        axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(),
+        legend.text=element_text(size=8))
+
+#####################
+## Discovery Data by year ##
+#####################
+
+## MRAS
+MRASdisco_year<-MRASdem%>%
+  distinct(Date,EGNO)%>%
+  group_by(Date,EGNO)%>%
+  tally()%>%
+  mutate(Year = year(Date))
+
+MRASdisco_year_ls<-split(MRASdisco_year, MRASdisco_year$Year)
+
+freqcap_ls<-lapply(MRASdisco_year_ls, function(x){
+  freqcap<-x%>%
+    tidyr::spread(Date,n)%>%
+    dplyr::select(-EGNO,-Year)%>%
+    as.data.frame()
+  
+  freqcap[is.na(freqcap)] <- 0
+  freqcap
+})
+
+desc<-lapply(freqcap_ls, function(x){
+  
+  desc<-Rcapture::descriptive(x)
+  
+  desc.df<-as.data.frame(desc$base.freq, row.names = FALSE)
+  
+  desc.df<-desc.df%>%
+    mutate(date = names(x),
+           disc = cumsum(ui),
+           csid = cumsum(vi),
+           order = 1:nrow(desc.df),
+           year = year(date))
+  
+  desc.df$disc<-as.numeric(desc.df$disc)
+  
+  desc.df })
+
+MRASdisco_year<-do.call("rbind", desc)
+MRASdisco_year<-MRASdisco_year%>%
+  mutate(survey = yday(date))
+MRASdisco_year$year<-as.factor(MRASdisco_year$year)
+
+## ALLDATA 
+ALLDATAdisco_year<-GSLdem%>%
+  distinct(Date,EGNO)%>%
+  group_by(Date,EGNO)%>%
+  tally()%>%
+  mutate(Year = year(Date))
+
+ALLDATAdisco_year_ls<-split(ALLDATAdisco_year, ALLDATAdisco_year$Year)
+
+ALLDATAfreqcap_ls<-lapply(ALLDATAdisco_year_ls, function(x){
+    freqcap<-x%>%
+      tidyr::spread(Date,n)%>%
+      dplyr::select(-EGNO,-Year)%>%
+      as.data.frame()
+    
+    freqcap[is.na(freqcap)] <- 0
+    freqcap
+    })
+
+ALLDATAdesc<-lapply(ALLDATAfreqcap_ls, function(x){
+  
+  desc<-Rcapture::descriptive(x)
+  
+  desc.df<-as.data.frame(desc$base.freq, row.names = FALSE)
+  
+  desc.df<-desc.df%>%
+    mutate(date = names(x),
+         disc = cumsum(ui),
+         csid = cumsum(vi),
+         order = 1:nrow(desc.df),
+         year = year(date))
+
+desc.df$disc<-as.numeric(desc.df$disc)
+
+desc.df })
+
+ALLDATAdisco_year<-do.call("rbind", ALLDATAdesc)
+ALLDATAdisco_year<-ALLDATAdisco_year%>%
+  mutate(survey = yday(date))%>%
+  group_by(year)%>%
+  mutate(lastseen = max(disc)-csid)
+ALLDATAdisco_year$year<-as.factor(ALLDATAdisco_year$year)
+
+ALLDATAdisco_mras<-MRASdisco_year%>%
+  left_join(ALLDATAdisco_year, by = "date")%>%
+  dplyr::select(survey.x,survey.y, disc.x,disc.y)
+
+#####################
+
+disco_byyear<-ggplot()+
+  geom_point(ALLDATAdisco_year, mapping = aes(x=survey, y = disc, colour = year), alpha = 0.5, size = 2)+
+  geom_point(ALLDATAdisco_year%>%filter(year == 2019), mapping = aes(x=survey, y = disc), colour = "gold2", alpha = 0.8, shape = 1, size = 2)+
+  geom_line(aes(x=ALLDATAdisco_year$survey, y = ALLDATAdisco_year$disc, colour = ALLDATAdisco_year$year), alpha = 0.6, size = 0.75)+
+  geom_point(aes(x=ALLDATAdisco_mras$survey.y, y = ALLDATAdisco_mras$disc.y), colour = "black", size = 0.75)+
+  theme_bw()+
+  scale_colour_viridis_d(option = "plasma", name = '')+
+  xlab("Date")+
+  ylab("")+
+  theme(panel.grid.minor = element_blank(),
+        legend.position="bottom",
+        axis.text.y = element_blank(),
+        legend.text=element_text(size=8))+
+  scale_x_continuous(breaks = c(121,152,182,213,244,274,305,335), labels = c("May","June","July","Aug","Sep","Oct","Nov","Dec"), limits = c(121,341))+
+  ylim(c(0,200))
+
+fig2<-ggarrange(disco_allyears,disco_byyear, labels = "AUTO", ncol = 2, common.legend = T, legend = "bottom", align = "h", widths = c(1.25,1))
+ggsave(filename = 'Fig2.svg',fig2,device = 'svg','./Figures', width = 169, height = 80, units = "mm", dpi = 320)
+```
+```{r sexratio, echo = FALSE, message = FALSE, warning = FALSE}
+##sex ratio
+GSLratio<-GSLdem%>%
+  distinct(SightingYear,SightingMonth,EGNO,Sex)%>%
+  group_by(SightingYear,SightingMonth,Sex)%>%
+  tally()%>%
+  mutate(total = sum(n),
+         m_r = case_when(
+           total > 50 & SightingYear >=2017 ~ "mr",
+           SightingMonth == 8 & SightingYear == 2015 ~ "mr",
+           total <= 50 ~ "no"),
+         perc = n/total)
+
+GSLratio$Sex<-factor(GSLratio$Sex, levels = c("X","F","M"))
+
+sexratiofig<-ggplot(GSLratio)+
+  geom_hline(yintercept=1.2, color = "grey", size = 0.25, alpha = 0.4)+  
+  geom_col(mapping = aes(x=SightingMonth,y=perc,fill = Sex), alpha = 0.6, color = "grey50", size = 0.25)+
+  geom_col(data=GSLratio[(GSLratio$m_r=="mr" & GSLratio$Sex=="F"),], aes(x=SightingMonth,y=1), size = 0.5, alpha=0, color="black")+
+  facet_wrap(~SightingYear,ncol = 1)+
+  theme_bw()+
+  ylab("Proportion")+
+  xlab("Month")+
+  scale_x_continuous(breaks = c(5:12), labels = c("May","June","July","Aug","Sep","Oct","Nov","Dec"))+
+  scale_y_continuous(breaks = seq(0,1.0, by = 0.2), labels = c(0,0.2,0.4,0.6,0.8,1.0), sec.axis =  sec_axis(~ . * 100, breaks = c(0,40,80,120), name = "Individuals sighted"))+
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.position = c(0.85,0.925),
+        legend.background = element_rect(fill="white", size=0.5, linetype="solid", colour ="black"),
+        legend.key.size = unit(0.7, "line"),
+        legend.margin=margin(c(0.5,3,3,3)),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  geom_point(mapping = aes(x=SightingMonth,y=total/100), color = "black")+
+  geom_hline(yintercept=0.6, linetype="dashed", color = "black", size = 0.5)+
+  scale_fill_viridis(discrete = TRUE, begin = 1, end = 0) 
+
+ggsave(filename = 'Fig3.svg',sexratiofig,device = 'svg', './Figures', width = 71, height = 154, units = "mm", dpi = 320)
+```
+```{r caprat, echo = FALSE, message = FALSE, warning = FALSE}
+###################
+## Capture Rates ##
+###################
+
+GSLdem$SightingYear<-as.factor(GSLdem$SightingYear)
+
+capturerate<-GSLdem%>%
+  #only one sighting per whale per day
+  distinct(SightingYear,SightingMonth,SightingDay,EGNO,Sex,AgeClass)%>%
+  group_by(SightingYear,EGNO)%>%
+  mutate(count = n())%>%
+  distinct(SightingYear,EGNO,count,Sex,AgeClass)
+
+capturerate_demo<-capturerate%>%
+  group_by(SightingYear,count,Sex)%>%
+  mutate(count_sex = n())%>%
+  distinct(SightingYear, count, Sex, count_sex)%>%
+  filter(Sex != "X")%>%
+  ungroup()%>%
+  group_by(SightingYear, count)%>%
+  mutate(sum = sum(count_sex),
+         perc = round(count_sex/sum,2)*100)
+
+#capture rate histos
+caprateplot<-ggplot(capturerate, mapping = aes(x = count, y = SightingYear, fill = SightingYear)) +
+  geom_density_ridges(alpha = 0.5)+
+  scale_fill_viridis_d(option = "plasma", name = '')+
+  theme_bw()+
+  xlab("# Captures (days)")+
+  ylab("Individuals")+
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "none",
+        text = element_text(size = 10))+
+  ylab("")
+
+```
+```{r return, echo = FALSE, warning = FALSE, message = FALSE}
+
+#ID by year
+ID_by_year<-capturerate%>%
+  dplyr::select(-AgeClass)%>%
+  spread(SightingYear, value = count)
+# 
+ID_15<-ID_by_year%>%filter(!is.na(`2015`))%>%dplyr::select(EGNO)
+ID_16<-ID_by_year%>%filter(!is.na(`2016`))%>%dplyr::select(EGNO)
+ID_17<-ID_by_year%>%filter(!is.na(`2017`))%>%dplyr::select(EGNO)
+ID_18<-ID_by_year%>%filter(!is.na(`2018`))%>%dplyr::select(EGNO)
+## remove 2019 calves
+ID_19<-ID_by_year%>%filter(!is.na(`2019`) & !grepl('2019CalfOf',EGNO) & EGNO != "4903" & EGNO != "4991")%>%dplyr::select(EGNO)
+
+### fix colors
+myCol<-viridis(5, option = "C")
+
+#Below if Fig. 4A -- output it html which was then saved as png
+#library(nVennR)
+#x<-plotVenn(list(`2015`=ID_15$EGNO,`2016`=ID_16$EGNO,`2017`=ID_17$EGNO,`2018`=ID_18$EGNO, `2019`=ID_19$EGNO), nCycles=10000, outFile = "./euler.png")
+
+#comment out the below for markdown since this was saved as a png
+#showSVG(x, opacity=0.2, systemShow = T, labelRegions = F, borderWidth = 2, setColors = viridis(5, option = "C"), fontScale = 1.5)
+
+```
+```{r residency, echo = FALSE, warning = FALSE, message = FALSE, out.width='100%'}
+###############
+## Residency ##
+###############
+
+res<-GSLdem%>%
+  group_by(SightingYear, EGNO, Date, Sex, AgeClass)%>%
+  distinct(SightingYear, EGNO, Date, Sex, AgeClass)%>%
+  arrange(SightingYear, EGNO, Date)%>%
+  group_by(SightingYear,EGNO)%>%
+  slice(1, n())%>%
+  mutate(first = yday(min(Date)), first_date = min(Date), last = yday(max(Date)), last_date = max(Date), `Residency (days)` = yday(max(Date))-yday(min(Date)))%>%
+  dplyr::select(-Date)%>%
+  distinct()
+
+res$EGNO<-as.factor(res$EGNO)
+
+reshist<-ggplot(res, mapping = aes(x = `Residency (days)`, y = SightingYear, fill = SightingYear)) +
+  theme_bw()+
+  geom_density_ridges(alpha = 0.5, trim = T)+
+  scale_fill_viridis_d(option = "plasma", name = '')+
+  theme(panel.grid.minor = element_blank(),
+        legend.position="none",
+        axis.text.y=element_blank(),
+        text = element_text(size = 10))+
+  ylab("")
+
+GSLdem_deadkeep$SightingYear<-as.factor(GSLdem_deadkeep$SightingYear)
+
+res_dead<-GSLdem_deadkeep%>%
+  group_by(SightingYear, EGNO, Date, Sex, AgeClass)%>%
+  distinct(SightingYear, EGNO, Date, Sex, AgeClass)%>%
+  arrange(SightingYear, EGNO, Date)%>%
+  group_by(SightingYear,EGNO)%>%
+  slice(1, n())%>%
+  mutate(first = yday(min(Date)), last = yday(max(Date)), `Residency (days)` = yday(max(Date))-yday(min(Date)))%>%
+  dplyr::select(-Date)%>%
+  distinct()%>%
+  left_join(res, by = c("EGNO","SightingYear","Sex","AgeClass","last"))%>%
+  dplyr::select(-first.x)%>%
+  rename("first" = "first.y")
+
+res_dead$EGNO<-as.factor(res_dead$EGNO)
+
+res_all<-res%>%
+  group_by(SightingYear, EGNO)%>%
+  tidyr::complete(first = first:last)%>%
+  dplyr::select(SightingYear,EGNO, jday = first)
+
+res_stats<-res_all%>%
+  group_by(SightingYear, jday)%>%
+  dplyr::summarise(count = n())%>%
+  group_by(SightingYear)%>%
+  filter(count == max(count))
+
+res_all_bar<-ggplot(res_all, mapping = aes(x = jday, y = SightingYear)) + 
+  geom_bin2d(binwidth = 1)+
+  geom_point(res_dead, mapping =aes(x = last, y = SightingYear), color = "red", size = 2, alpha = 0.8)+
+  theme_bw()+
+  scale_fill_viridis(breaks = seq(from = 0, to = 125, by = 25))+
+  scale_x_continuous(breaks = c(121,153,183,214,245,275,306,336), labels = c("May","June","July","Aug","Sept","Oct","Nov","Dec"), limits = c(121,354), name = "Month")+
+  ylab("")+
+   theme(panel.grid.minor = element_blank(),
+         legend.position="right",
+         axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.25),
+         text = element_text(size = 10))
+######
+resight<-GSLdem%>%
+  arrange(EGNO,SightingYear,Date)%>%
+  group_by(EGNO,SightingYear)%>%
+  mutate(day_dif = as.numeric(dplyr::lead(Date) - Date))%>%
+  filter(!is.na(day_dif))%>%
+  dplyr::select(EGNO,SightingYear,Date,day_dif)%>%
+  group_by(SightingYear, EGNO)%>%
+  sample_n(1)
+
+#######
+  ##below is to save the sampled data from the above process for the figures and results
+  #write.csv(resight,'./data/resight_sample.csv', row.names = F)
+#######
+
+resight<-read.csv('./data/resight_sample.csv', stringsAsFactors = F, header = T)
+
+resight_summary<-resight%>%
+  ungroup()%>%
+  dplyr::summarise(max = max(day_dif), min = min(day_dif), mean = round(mean(day_dif),0), sd = round(sd(day_dif),0), q25 = quantile(day_dif, probs = 0.25), q51 = quantile(day_dif, probs = 0.51), q52 = quantile(day_dif, probs = 0.52), q95 = round(quantile(day_dif, probs = 0.95),0), median = median(day_dif))
+
+resight$SightingYear<-as.factor(resight$SightingYear)
+
+resightplot<-ggplot(resight, mapping = aes(x = day_dif, y = SightingYear, fill = SightingYear)) +
+  theme_bw()+
+  geom_density_ridges(alpha = 0.5)+
+  scale_fill_viridis_d(option = "plasma", name = '')+
+  theme(panel.grid.minor = element_blank(),
+        legend.position="none",
+        axis.text.y=element_blank(),
+        text = element_text(size = 10))+
+  ylab("")+
+  xlab("Recapture lag (days)")+
+  xlim(c(0,150))+
+  geom_vline(xintercept = resight_summary$median, linetype = "dashed")
+
+bcd<-ggarrange(caprateplot,resightplot,reshist,  ncol = 3, nrow = 1,labels = c('B','C','D'), widths = c(1.2,1,1))
+bcde<-ggarrange(bcd, res_all_bar, labels = c('','E'), ncol = 1, heights = c(1,0.75))
+ggsave(filename = 'Fig4B.svg',bcde,device = 'svg', './Figures', width = 5, height = 5, units = "in", dpi = 320)
+```
+```{r capturehistory, echo = FALSE, message = FALSE, warning = FALSE}
+
+#################################################
+MRASdem_abund<-MRASdem%>%filter(Date != "2018-08-12")
+MRASdem.yr<-split(MRASdem_abund,MRASdem_abund$SightingYear)
+MRAS_freqcap<-lapply(MRASdem.yr, freqcap)
+
+#################################################
+## All data compared to time period of MRAS ##
+##remove all but first occasion of dead sighting
+#MRAS: 01-15June,#09-24July,#14-29Aug,#14Oct-29Oct
+ALLDATAabund_compare<-allGSLdem%>%
+  filter((Date >= "2017-06-22" & Date <= "2017-07-29") |
+         (Date >= "2018-06-04" & Date <= "2018-08-10") |
+         (Date >= "2019-05-30" & Date <= "2019-06-18") |
+         (Date >= "2019-07-07" & Date <= "2019-07-26") |
+         (Date >= "2019-08-11" & Date <= "2019-08-30") | 
+         (Date >= "2019-10-12" & Date <= "2019-10-31"))%>%
+  filter(SightingMonth != 9)%>%
+  filter(EGNO != 'UKDEAD1' & EGNO != 'UKDEAD2' & EGNO != '' & !grepl("D-",EGNO))
+
+GSLabund_notdead<-ALLDATAabund_compare%>%
+  filter(!grepl('DEAD',Behaviors))
+
+#keeping only first occasion of dead sighting
+GSLabund_deadkeep<-deadfirst(ALLDATAabund_compare)
+
+#stitch it back together
+#GSLabund is all data sightings (MRAS + NARWC), but only the first occasion for animals sighted dead
+GSLabund<-rbind(GSLabund_notdead,GSLabund_deadkeep)
+
+#################################################
+GSLabund.yr<-split(GSLabund,GSLabund$SightingYear)
+GSL_freqcap<-lapply(GSLabund.yr, freqcap)
+#################################################
+
+####################
+# ALL DATA on its own #
+####################
+
+ALLDATAabund.yr<-split(GSLdem,GSLdem$SightingYear)
+ALLDATA_freqcap<-lapply(ALLDATAabund.yr, freqcap)
+
+GSLdem_notdead$SightingYear<-as.factor(GSLdem_notdead$SightingYear)
+
+```
+```{r mra, echo = FALSE, message = FALSE, warning = FALSE, results = "hide"}
+
+############
+## 10 day Blocks ##
+############
+
+## MRAS ##
+##########
+## 2017 ##
+block1<-rowSums(MRAS_freqcap$`2017`%>%dplyr::select_if(grepl("-06-",names(.)) & day(names(.)) > 20 )) #June21-June30 
+block2<-rowSums(MRAS_freqcap$`2017`%>%dplyr::select_if((grepl("-07-",names(.)) & day(names(.)) <= 10))) #July01 - July10
+block3<-rowSums(MRAS_freqcap$`2017`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) > 10 & day(names(.)) <= 20)) #July10 - July20
+block4<-rowSums(MRAS_freqcap$`2017`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) > 20 & day(names(.)) <= 30)) #July21 - July30
+
+#recombine the data
+ch.MRAS17<-as.data.frame(cbind(block1,block2,block3,block4))
+#convert integers >0 to 1s
+ch.MRAS17[ch.MRAS17>1]<-1
+
+##########
+## 2018 ##
+block1<-rowSums(MRAS_freqcap$`2018`%>%dplyr::select_if(grepl("-06-",names(.)) & day(names(.)) <= 10)) #1-10June
+block2<-rowSums(MRAS_freqcap$`2018`%>%dplyr::select_if(grepl("-06-",names(.)) & day(names(.)) > 10 & day(names(.)) <= 20)) #11-20June
+block3<-rowSums(MRAS_freqcap$`2018`%>%dplyr::select_if(grepl("-06-",names(.)) & day(names(.)) > 20 )) #21-30June
+block4<-rowSums(MRAS_freqcap$`2018`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) <= 10)) #01-10July
+block5<-rowSums(MRAS_freqcap$`2018`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) > 10 & day(names(.)) <= 20)) #11July-20July
+block6<-rowSums(MRAS_freqcap$`2018`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) > 20 & day(names(.)) <= 30)) #21July-30July
+block7<-rowSums(MRAS_freqcap$`2018`%>%dplyr::select_if(grepl("-07-31",names(.)) |  grepl("-08-",names(.)) & day(names(.)) <= 9)) #31Jul-09Aug
+
+#recombine the data
+ch.MRAS18<-as.data.frame(cbind(block1,block2,block3,block4,block5,block6,block7))
+#convert integers >0 to 1s
+ch.MRAS18[ch.MRAS18>1]<-1
+
+##########
+## 2019 ##
+
+#June4-13
+block1<-rowSums(MRAS_freqcap$`2019`%>%dplyr::select_if(grepl("-06-",names(.)) & day(names(.)) <= 8 )) 
+block2<-rowSums(MRAS_freqcap$`2019`%>%dplyr::select_if(grepl("-06-",names(.)) & day(names(.)) > 8 )) 
+#July9-22
+block3<-rowSums(MRAS_freqcap$`2019`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) <= 16 )) 
+block4<-rowSums(MRAS_freqcap$`2019`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) > 16 ))
+#August14-26
+block5<-rowSums(MRAS_freqcap$`2019`%>%dplyr::select_if(grepl("-08-",names(.)) & day(names(.)) <= 20 )) 
+block6<-rowSums(MRAS_freqcap$`2019`%>%dplyr::select_if(grepl("-08-",names(.)) & day(names(.)) > 20 )) 
+#October14-29
+block7<-rowSums(MRAS_freqcap$`2019`%>%dplyr::select_if(grepl("-10-",names(.)) & day(names(.)) <= 21 ))
+block8<-rowSums(MRAS_freqcap$`2019`%>%dplyr::select_if(grepl("-10-",names(.)) & day(names(.)) > 21 ))
+
+#recombine the data
+ch.MRAS19<-as.data.frame(cbind(block1,block2,block3,block4,block5,block6,block7,block8))
+#convert integers >0 to 1s
+ch.MRAS19[ch.MRAS19>1]<-1
+
+#################################################
+## ALL DATA ##
+###########
+
+###########
+## 2017  ##
+#21-30June 
+block1<-rowSums(GSL_freqcap$`2017`%>%dplyr::select_if(grepl("-06-",names(.)) & day(names(.)) > 20 & day(names(.)) <= 30)) 
+#July01 - July10
+block2<-rowSums(GSL_freqcap$`2017`%>%dplyr::select_if( (grepl("-07-",names(.)) & day(names(.)) <= 10))) 
+#July11 - July20
+block3<-rowSums(GSL_freqcap$`2017`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) > 10 & day(names(.)) <= 20))
+#July21 - July30
+block4<-rowSums(GSL_freqcap$`2017`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) > 20 & day(names(.)) <= 30)) 
+
+ch.alldata_s17<-as.data.frame(cbind(block1,block2,block3,block4))
+ch.alldata_s17[ch.alldata_s17>1]<-1
+
+###########
+## 2018  ##
+#1-10June
+block1<-rowSums(GSL_freqcap$`2018`%>%dplyr::select_if(grepl("-06-",names(.)) & day(names(.)) <= 10))
+#11-20June
+block2<-rowSums(GSL_freqcap$`2018`%>%dplyr::select_if(grepl("-06-",names(.)) & day(names(.)) > 10 & day(names(.)) <= 20))
+#21-30June
+block3<-rowSums(GSL_freqcap$`2018`%>%dplyr::select_if(grepl("-06-",names(.)) & day(names(.)) > 20 )) 
+#01-10July
+block4<-rowSums(GSL_freqcap$`2018`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) <= 10)) 
+#11-20July
+block5<-rowSums(GSL_freqcap$`2018`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) > 10 & day(names(.)) <= 20)) 
+#21July-31July
+block6<-rowSums(GSL_freqcap$`2018`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) > 20 & day(names(.)) <= 30))
+#31July-09 Aug
+block7<-rowSums(GSL_freqcap$`2018`%>%dplyr::select_if(grepl("-07-31",names(.)) |  grepl("-08-",names(.)) & day(names(.)) <= 9)) 
+
+#recombine the data
+ch.alldata_s18<-as.data.frame(cbind(block1,block2,block3,block4,block5,block6,block7))
+ch.alldata_s18[ch.alldata_s18>1]<-1
+
+###########
+## 2019  ##
+#MRAS: 04June-13June,#09July-22July,#14Aug-26Aug,#14Oct-29Oct
+
+#01-16June
+block1<-rowSums(GSL_freqcap$`2019`%>%dplyr::select_if(grepl("-06-",names(.)) & day(names(.)) <= 8)) 
+block2<-rowSums(GSL_freqcap$`2019`%>%dplyr::select_if(grepl("-06-",names(.)) & day(names(.)) > 8 & day(names(.)) <= 16)) 
+#09-24July
+block3<-rowSums(GSL_freqcap$`2019`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) > 8 & day(names(.)) <= 16)) 
+block4<-rowSums(GSL_freqcap$`2019`%>%dplyr::select_if(grepl("-07-",names(.)) & day(names(.)) > 16 & day(names(.)) <= 24))
+#13-28Aug
+block5<-rowSums(GSL_freqcap$`2019`%>%dplyr::select_if(grepl("-08-",names(.)) & day(names(.)) > 12 & day(names(.)) <= 20)) 
+block6<-rowSums(GSL_freqcap$`2019`%>%dplyr::select_if(grepl("-08-",names(.)) & day(names(.)) > 20 & day(names(.)) <= 28)) 
+#14-29Oct
+block7<-rowSums(GSL_freqcap$`2019`%>%dplyr::select_if(grepl("-10-",names(.)) & day(names(.)) > 13 & day(names(.)) <= 21 ))
+block8<-rowSums(GSL_freqcap$`2019`%>%dplyr::select_if(grepl("-10-",names(.)) & day(names(.)) > 21 & day(names(.)) <= 29 ))
+
+#recombine the data
+ch.alldata_s19<-as.data.frame(cbind(block1,block2,block3,block4,block5,block6,block7,block8))
+ch.alldata_s19[ch.alldata_s19>1]<-1
+
+#############
+# 2015–2019 #
+#############
+### Blocks for all years
+ALLDATA_yrs_freqcap<-freqcap(GSLdem)
+
+ch2015<-rowSums(ALLDATA_yrs_freqcap%>%dplyr::select_if(grepl("2015",names(.)))) 
+ch2016<-rowSums(ALLDATA_yrs_freqcap%>%dplyr::select_if(grepl("2016",names(.)))) 
+ch2017<-rowSums(ALLDATA_yrs_freqcap%>%dplyr::select_if(grepl("2017",names(.)))) 
+ch2018<-rowSums(ALLDATA_yrs_freqcap%>%dplyr::select_if(grepl("2018",names(.)))) 
+ch2019<-rowSums(ALLDATA_yrs_freqcap%>%dplyr::select_if(grepl("2019",names(.)))) 
+
+ch.allyears<-as.data.frame(cbind(ch2015,ch2016,ch2017,ch2018,ch2019))
+ch.allyears[ch.allyears>1]<-1
+################################
+
+#fit models
+mra_aic<-function(x){
+  
+  whales.mat<-as.matrix(x)
+  whales.mat<-unname(whales.mat)
+  ch_vect<-marked::collapseCH(whales.mat)
+  whalesch<-data.frame(ch = ch_vect)
+  whalesch$ch<-as.character(whalesch$ch)
+  
+  whales.proc<-marked::process.data(whalesch, model = "JS")
+  whales.ddl<-make.design.data(whales.proc)
+  
+  #run several models
+  ###################
+  #try to get N out
+  #include the hessians to check that there are no
+  #NANs in the uncertainties - cos small data set
+  #crm = capture/recapture model
+  
+  fit.models=function()
+  {
+    
+    Phi.dot=list(formula=~1)
+    Phi.time=list(formula=~time)
+    p.dot=list(formula=~1)
+    p.time=list(formula=~time)
+    pent.time=list(formula=~time)
+    
+    crm.base<-marked::crm(whales.proc, hessian=TRUE,
+                          model.parameters=list(Phi=Phi.dot,
+                                                p=p.dot,
+                                                pent=pent.time,
+                                                N=list(formula=~1)))
+    
+    cml=create.model.list(c("Phi","p","pent"))
+    results=marked::crm.wrapper(cml,data=whales.proc, ddl=whales.ddl, hessian = TRUE,
+                                external=FALSE, accumulate=FALSE)
+    return(results)
+  }
+  
+  fit.models()
+  
+}
+
+################################
+MRAS17.aic<-mra_aic(ch.MRAS17)
+MRAS18.aic<-mra_aic(ch.MRAS18)
+MRAS19.aic<-mra_aic(ch.MRAS19)
+alldata_s17.aic<-mra_aic(ch.alldata_s17)
+alldata_s18.aic<-mra_aic(ch.alldata_s18)
+alldata_s19.aic<-mra_aic(ch.alldata_s19)
+allyears.aic<-mra_aic(ch.allyears)
+###############################################
+
+```
+
+```{r AICtables, echo = FALSE, message = FALSE, warning = FALSE, results = F}
+
+JStab<-data.frame(Model_name = c(  "Phi(~1)p(~1)pent(~time)",
+                                   "Phi(~1)p(~time)pent(~time)",
+                                   "Phi(~time)p(~1)pent(~time)",
+                                   "Phi(~time)p(~time)pent(~time)"),
+              Model = c(  "\\textit{$\\phi$(.) p(.) pent(\\textsubscript{t})}",
+                          "\\textit{$\\phi$(.) p(\\textsubscript{t}) pent(\\textsubscript{t})}",
+                          "\\textit{$\\phi$(\\textsubscript{t}) p(.) pent(\\textsubscript{t})}",
+                          "\\textit{$\\phi$(\\textsubscript{t}) p(\\textsubscript{t}) pent(\\textsubscript{t})}"))
+
+####
+
+library(qpcR)
+AICtoAICc<-function(x,y){
+
+  AICc<-x%>%
+    mutate(AICc=AIC+( (2*npar^2 + 2*npar) / (y-npar-1) ))
+
+  AICc_calc<-dplyr::bind_rows(qpcR::akaike.weights(AICc$AICc))%>%
+    dplyr::rename("deltaAICc" = "deltaAIC", "weight.c" = "weights", "relative.likelihood" = "rel.LL")
+  
+  AICc%>%
+  bind_cols(AICc_calc)%>%
+    arrange(deltaAICc)%>%
+    dplyr::select(model, npar, AICc, deltaAICc, weight.c, relative.likelihood,
+                  convergence, Dataset)%>%
+    mutate_if(is.numeric, round, digits = 2)
+}
+
+```
+```{r Abundance, echo = FALSE, message = FALSE, warning = FALSE, results = F}
+
+########
+# 2017 #
+########
+
+source('./script/mra/2017.R', local = TRUE)$value
+N_MRAS17<-N_avg_m17%>%mutate(Dataset = "MRAS",Year = 2017)
+N_ad17<-N_avg_ad17%>%mutate(Dataset = "All data",Year = 2017)
+
+########
+# 2018 #
+########
+
+source('./script/mra/2018.R', local = TRUE)$value
+N_MRAS18<-N_avg_m18%>%mutate(Dataset = "MRAS", Year = 2018)
+N_ad18<-N_avg_ad18%>%mutate(Dataset = "All data",Year = 2018)
+
+########
+# 2019 #
+########
+
+source('./script/mra/2019.R', local = TRUE)$value
+N_MRAS19<-N_avg_m19%>%mutate(Dataset = "MRAS", Year = 2019)
+N_ad19<-N_avg_ad19%>%mutate(Year = 2019, Dataset = "All data")
+
+####################################
+all_N_table<-N_MRAS17%>%bind_rows(N_MRAS18)%>%bind_rows(N_MRAS19)%>%
+  bind_rows(N_ad17)%>%bind_rows(N_ad18)%>%bind_rows(N_ad19)%>%
+  arrange(Year,desc(Dataset))%>%
+  mutate(first = case_when(
+    Year == 2017 ~ "2017-06-21",
+    Year == 2018 ~ "2018-06-01",
+    Year == 2019 ~ "2019-06-01"),
+  last = case_when(
+    Year == 2017 ~ "2017-07-30",
+    Year == 2018 ~ "2018-08-10",
+    Year == 2019 ~ "2019-10-29"))
+
+all_N<-reshape2::melt(all_N_table, id=c("estimate","se","lcl","ucl","Dataset","Year"))
+all_N$Year<-as.factor(all_N$Year)
+all_N$Dataset<-as.factor(all_N$Dataset)
+all_N$value<-ymd(all_N$value)
+
+alldataonly<-GSLabund%>%
+  filter(SightingYear != 2016)%>%
+  filter(!grepl('NEFSC/T',ObserverCode))%>%
+  distinct(SightingYear,EGNO)%>%
+  group_by(SightingYear)%>%
+  tally()
+
+days<-GSLabund%>%
+  filter(SightingYear != 2016)%>%
+  mutate(ObserverCode = case_when(
+    ObserverCode == 'NEFSC/T' ~ 'MRAS',
+    TRUE ~ 'All data'))%>%
+  distinct(SightingYear,Date,ObserverCode)%>%
+  group_by(SightingYear,ObserverCode)%>%
+  tally()%>%
+  group_by(SightingYear)%>%
+  mutate(tot = sum(n))%>%
+  filter(ObserverCode == "MRAS")
+
+all_N_table<-all_N_table%>%
+  arrange(Year,desc(Dataset))%>%
+  mutate(Estimate = round(estimate,0),
+         SE = round(se,0),
+         lcl = round(lcl,0),
+         ucl = round(ucl,0),
+         first = format(as.Date(first), "%d %b"),
+         last = format(as.Date(last), "%d %b"))%>%
+  mutate(`95% CI` = paste0(sprintf("%.0f",lcl),'--',ucl),
+         `Date Range` = paste0(first,'--',last),
+         Observed_only = c(nrow(ch.MRAS17),nrow(ch.alldata_s17),
+                           nrow(ch.MRAS18),nrow(ch.alldata_s18),
+                           nrow(ch.MRAS19),nrow(ch.alldata_s19)),
+         Observed = c(nrow(ch.MRAS17),paste0(nrow(ch.alldata_s17)," (", alldataonly$n[1],")"),
+                      nrow(ch.MRAS18),paste0(nrow(ch.alldata_s18)," (", alldataonly$n[2],")"),
+                      nrow(ch.MRAS19),paste0(nrow(ch.alldata_s19)," (", alldataonly$n[3],")")),
+         `Sampling Days` = c(days$n[1],days$tot[1],
+                           days$n[2],days$tot[2],
+                           days$n[3],days$tot[3]))%>%
+  mutate( abund_est = Observed_only + Estimate, 
+          abund_est_95CI = paste0((Observed_only+lcl),'--',(Observed_only+ucl)))%>%
+  dplyr::select(`Date Range`,Dataset,`Sampling Days`,Observed,Estimate,SE,`95% CI`,abund_est, abund_est_95CI)
+
+#########
+## Abundance from all years
+#########
+
+source('./script/mra/across_years.R', local = TRUE)$value
+
+survey_allyrs<-GSLdem%>%
+  distinct(Date)%>%
+  tally()
+
+egno_allyrs<-GSLdem%>%
+  distinct(EGNO)%>%
+  tally()
+
+alldata_yrs<-N_avg_allyrs%>%
+  mutate(Estimate = round(estimate,0),
+         SE = round(se,0),
+         lcl = round(lcl,0),
+         ucl = round(ucl,0),
+        `95% CI` = paste0(sprintf("%.0f",lcl),'--',ucl),
+         Observed = as.character(egno_allyrs$n),
+         Model = "Time-varying probability of capture",
+         `Sampling Days` = survey_allyrs$n,
+         `Date Range` = '2015 -- 2019',
+         Dataset = 'All data',
+         abund_est = as.numeric(Observed)+as.numeric(Estimate),
+         abund_est_95CI = paste0((as.numeric(Observed)+lcl),'--',(as.numeric(Observed)+ucl)))%>%
+  dplyr::select(-lcl,-ucl,-se,-estimate)
+
+###################
+
+Jstable_AICc<-m17_AICc%>%
+  bind_rows(ad17_AICc)%>%
+  bind_rows(m18_AICc)%>%
+  bind_rows(ad18_AICc)%>%
+  bind_rows(m19_AICc)%>%
+  bind_rows(ad19_AICc)%>%
+  bind_rows(all_AICc)%>%
+  dplyr::select(-convergence)%>%
+  left_join(JStab, by = c("model" = "Model_name"))%>%
+  mutate(Dataset = case_when(
+    deltaAICc == 0 ~ Dataset,
+    deltaAICc != 0 ~ ""))%>%
+  dplyr::select(Dataset, Model, everything(),-model)
+
+```
+```{r Movement, echo = FALSE, message = FALSE, warning = FALSE, fig.width=3, fig.height=2.5}
+###############################
+## Movement normalized to day 
+
+GSLdem_notdead_move<-GSLdem_notdead%>%
+  filter(AgeClass != 'C')%>%
+  filter(pos == 'A')
+
+#convert meters to kilometers
+  m_km<-1/1000
+#No dead animals used for resights
+GSLdem_notdead_lag<-GSLdem_notdead_move%>%
+  dplyr::select(EGNO,SightingYear,SightingTime,Date,Latitude,Longitude,Sex,AgeClass,days_per_month,days_per_year)%>%
+  arrange(EGNO,Date,SightingTime)%>%
+  group_by(EGNO, SightingYear)%>%
+  mutate(daydiff = Date - dplyr::lag(Date),
+         Lat2 = dplyr::lag(Latitude),
+         Lon2 = dplyr::lag(Longitude),
+         month2 = lubridate::month(dplyr::lag(Date)))%>%
+  ##calculates distance between points in kilometers
+  mutate(dist_km = geosphere::distVincentyEllipsoid(matrix(c(Longitude,Latitude), ncol = 2),matrix(c(Lon2, Lat2), ncol =2),a=6378137, f=1/298.257222101)*m_km)
+
+GSLdem_notdead_lag$daydiff<-as.numeric(GSLdem_notdead_lag$daydiff,units="days")
+
+  GSLdem_notdead_km_day<-GSLdem_notdead_lag%>%
+    filter(!is.na(daydiff))%>%
+    mutate(km_day = round(dist_km/daydiff,3),
+           km_hr = round((dist_km/daydiff)/24,3))%>%
+    filter(daydiff != 0)
+  
+  ##only resightings that occurred within a week or less, sample each individual once per year
+  GSLdem_notdead_km_day_samp<-GSLdem_notdead_km_day%>%
+    filter(daydiff <= resight_summary$median)%>%
+    group_by(SightingYear, EGNO)%>%
+    sample_n(1)
+  
+  ##below is to save the sampled data from the above process for the figures and results
+  #write.csv(GSLdem_notdead_km_day_samp,'./data/km_day_samp_median.csv', row.names = F)
+  
+  GSLdem_notdead_km_day_samp<-read.csv('./data/km_day_samp_median.csv', stringsAsFactors = F, header = T)
+  GSLdem_notdead_km_day_samp$SightingYear<-as.factor(GSLdem_notdead_km_day_samp$SightingYear)
+  
+yearmo<-ggplot()+
+  geom_point(GSLdem_notdead_move%>%distinct(SightingYear, days_per_year)%>%mutate(SightingYear = as.factor(SightingYear)), mapping = aes(x=SightingYear,y=days_per_year), color = "black", shape = 18, size = 2)+
+  geom_boxplot(GSLdem_notdead_km_day_samp, mapping = aes(y=km_day, x = SightingYear, fill = SightingYear, colour = SightingYear), alpha = 0.6, varwidth = TRUE)+
+  geom_boxplot(GSLdem_notdead_km_day_samp%>%filter(SightingYear == 2019), mapping = aes(y=km_day, x = SightingYear, fill = SightingYear), colour = "gold2", alpha = 0.6, varwidth = TRUE)+
+    theme_bw()+
+    scale_fill_viridis_d(option = "plasma", name = '')+
+    scale_colour_viridis_d(option = "plasma", name = '')+
+    theme(legend.position = 'none',
+          text = element_text(size = 10))+
+    ylab(expression(km~day^{-1}/'#'~of~sampling~days~' '))+
+    scale_y_continuous(limits = c(0,80))+
+    xlab('Year')
+
+##only resightings that occurred within a week or less, sample each individual once per year 
+GSLdem_notdead_km_day_month<-GSLdem_notdead_km_day%>%
+  filter(daydiff <= resight_summary$median)%>%
+  group_by(month2, EGNO)%>%
+  sample_n(1)
+
+ ##below is to save the sampled data from the above process for the figures and results
+ #write.csv(GSLdem_notdead_km_day_month,'./data/km_day_month_samp.csv', row.names = F)
+
+  GSLdem_notdead_km_day_month<-read.csv('./data/km_day_month_samp.csv', stringsAsFactors = F, header = T)
+  GSLdem_notdead_km_day_month$month2<-as.factor(GSLdem_notdead_km_day_month$month2)
+
+monthmo<-ggplot()+
+  geom_point(GSLdem_notdead_move%>%distinct(SightingMonth, days_per_month)%>%filter(SightingMonth != 12)%>%mutate(SightingMonth = as.factor(SightingMonth)), mapping = aes(x=SightingMonth,y=days_per_month), color = "red", shape = 18, size = 2)+
+  geom_boxplot(GSLdem_notdead_km_day_month, mapping = aes(y=km_day, x = month2, group = month2), varwidth = TRUE, alpha = 0.5, fill = "grey")+
+  ylab("")+
+  scale_x_discrete(labels = c("May","June","July","Aug","Sept","Oct","Nov"), name = "Month of recapture")+
+  theme_bw()+
+  theme(axis.text.y = element_blank())
+
+movefig<-ggarrange(yearmo, monthmo, nrow = 1, labels = c("B","C"))
+ggsave(filename = 'Fig5BC.svg',movefig,device = 'svg', './Figures', width = 169, height = 65, units = "mm", dpi = 320)
+
+```
+```{r Behavior, echo = FALSE, message = FALSE, warning = FALSE}
+
+#########################
+## Behavior
+##use allGSLdem to include all sightings of an animal in each day
+allGSL_behv<-allGSLdem%>%
+  filter(AgeClass != 'C')%>% #no dependent calves
+  filter(!grepl('DEAD',Behaviors))%>%
+  mutate(behv = case_when(
+    grepl('SAG',Behaviors) ~ 'SAG',
+    grepl('FD',Behaviors) | grepl('MCLSG',Behaviors) ~ 'FD',
+    TRUE ~ 'Neither'),
+    Behavior = case_when(
+    grepl('FD',Behaviors) ~ 'Vis feed',
+    grepl('MCLSG',Behaviors) ~ 'Prob feed',
+    grepl('SAG',Behaviors) ~ 'SAG',
+    TRUE ~ 'Neither'
+    ))
+
+all_behv<-allGSL_behv%>%
+  group_by(SightingYear,SightingMonth,Behavior)%>%
+  tally()%>%
+  mutate(total = sum(n),
+         porp = n/total,
+         m_r = case_when(
+           SightingYear == 2015 & SightingMonth == 8 ~ "mr",
+           total > 100 ~ "mr",
+           total <= 100 ~ "no"
+         ))
+
+all_behv$Behavior<-factor(all_behv$Behavior, levels = c("SAG","Neither","Prob feed","Vis feed"))
+
+cols <- c("SAG" = "#440154FF", "Neither" = "#31688EFF", "Prob feed" = "#35B779FF", "Vis feed" = "#FDE725FF")
+
+behv<-ggplot(all_behv)+
+  geom_hline(yintercept=1.2, color = "grey", size = 0.25, alpha = 0.4)+  
+  geom_col(mapping = aes(x=SightingMonth,y=porp,fill = Behavior), alpha = 0.6, color = "grey50", size = 0.25)+
+  geom_col(data=all_behv[(all_behv$m_r=="mr" & all_behv$Behavior=="Neither" ),], aes(x=SightingMonth,y=1), alpha=0, size = 0.5, color= "black")+
+  facet_wrap(~SightingYear,ncol = 1)+
+  theme_bw()+
+  ylab("Proportion")+
+  xlab("Month")+
+  scale_x_continuous(breaks = c(5:12), labels = c("May","June","July","Aug","Sep","Oct","Nov","Dec"))+
+  scale_y_continuous(breaks = seq(0,1.0, by = 0.2), labels = c(0,0.2,0.4,0.6,0.8,1.0), sec.axis =  sec_axis(~ . * 500, name = "Number of sightings"))+
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        #legend.position = c(0.80,0.925),
+        legend.position = c("right"),
+        legend.background = element_rect(fill="white", size=0.5, linetype="solid", colour ="black"),
+        legend.title = element_blank(),
+        legend.text=element_text(size=6),
+        legend.key.size = unit(0.7, "line"),
+        legend.margin=margin(c(0,2,2,2)),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  geom_point(mapping = aes(x=SightingMonth,y=total/500), color = "black")+
+  scale_fill_manual(values = cols)
+
+behvfig<-ggarrange(behv,labels = "A")
+ggsave(filename = 'Fig5A.svg',behvfig,device = 'svg', './Figures', width = 90, height = 154, units = "mm", dpi = 320)
+```
+```{r MCP, echo = FALSE, message = FALSE, warning = FALSE, out.width="100%"}
+############################
+## Minimum Convex Polygon ##
+## 90%
+############################
+
+library(wesanderson)
+
+noid<-allGSLdem%>%
+  filter(EGNO == "" | EGNO == 'UNMA')%>%
+  filter(pos == 'A')%>%
+  filter(AgeClass != 'C')
+
+ph_noid<-noid%>%
+  filter(SightingYear != '2015' & SightingYear != '2016')%>%
+  group_by(EGNO, SightingYear)%>%
+  add_count(EGNO)%>%
+  dplyr::select(EGNO,Latitude,Longitude,n)%>%
+  ungroup()
+
+ph_noid$SightingYear<-factor(ph_noid$SightingYear, levels = c(2017,2018,2019))
+
+GSLdem_notdead_ade<-GSLdem_notdead_move%>%
+  filter(SightingYear != '2015' & SightingYear != '2016')%>%
+  group_by(EGNO, SightingYear)%>%
+  add_count(EGNO)%>%
+  dplyr::select(EGNO,Latitude,Longitude,n)%>%
+  ungroup()
+GSLdem_notdead_ade$SightingYear<-factor(GSLdem_notdead_ade$SightingYear, levels = c(2017,2018,2019))
+
+##animals sighted less that 5 times
+GSLdem_notdead_4<-GSLdem_notdead_ade%>%
+  filter(n < 5)
+
+##animals sighted 5+ times
+GSLdem_notdead_5<-GSLdem_notdead_ade%>%
+  filter(n > 4)%>%
+  ungroup()
+
+#for analysis where 5+ resightings are needed
+GSLdem_notdead_spdf<-GSLdem_notdead_5%>%
+  dplyr::select(-n)
+#make all individuals the same
+GSLdem_notdead_same<-GSLdem_notdead_ade%>%
+  bind_rows(ph_noid)%>%
+  dplyr::select(-n)%>%
+  mutate(EGNO = 1)
+
+GSLdem_notdead_spdf_year<-split(GSLdem_notdead_spdf,GSLdem_notdead_spdf$SightingYear)
+GSLdem_notdead_spdf_year<-lapply(GSLdem_notdead_spdf_year, function(x){x%>%dplyr::select(-SightingYear)})
+
+GSLdem_notdead_same_year<-split(GSLdem_notdead_same,GSLdem_notdead_same$SightingYear)
+GSLdem_notdead_same_year<-lapply(GSLdem_notdead_same_year, function(x){x%>%dplyr::select(-SightingYear)})
+
+######
+#Convex polygon data frame function
+#percent is currently set for 90%
+cp.df90<-function(x){
+  coordinates(x)<- ~Longitude+Latitude
+  proj4string(x)<-CRS.latlon
+##change projection for calculating
+  x.sp<-spTransform(x, CRS.utm)
+  cp<-mcp(x.sp, percent=90)
+  #projection for mapping
+  cp.sp<-spTransform(cp, CRS.R)
+  cp.sp@data$id = rownames(cp.sp@data)
+  cp.points = fortify(cp.sp, region="id")
+  left_join(cp.points, cp.sp@data, by="id")
+}
+
+cp.df90area<-function(x){
+  coordinates(x)<- ~Longitude+Latitude
+  proj4string(x)<-CRS.latlon
+##change projection for calculating
+  x.sp<-spTransform(x, CRS.utm)
+  mcp.area(x.sp, percent=90, unin = "m",unout = "km2", plotit=FALSE)
+}
+
+cp.df90id<-function(x){
+  coordinates(x)<- ~Longitude+Latitude
+  proj4string(x)<-CRS.latlon
+##change projection for calculating
+  x.sp<-spTransform(x, CRS.utm)
+  cp<-mcp(x.sp, percent=90)
+  #projection for mapping
+  cp.sp<-spTransform(cp, CRS.R)
+  cp.sp@data$id = rownames(cp.sp@data)
+  cp.points = fortify(cp.sp, region="id")
+  cpout<-left_join(cp.points, cp.sp@data, by="id")
+  unionid<-aggregate(cp.sp,dissolve=T)
+  unionid.points = fortify(unionid, region="id")
+  unionout<-left_join(unionid.points, cp.sp@data, by="id")
+  list(cpout = cpout,union = unionout)
+}
+
+######
+#the following function takes the result from cp.df to make a raster
+r_df<-function(x){
+  cp.df.ls<-x$cpout%>%dplyr::select(id,long,lat)
+  cp.list<-split(cp.df.ls, cp.df.ls$id)
+  cp.list2<-lapply(cp.list, function(x){x%>%dplyr::select(-id)})
+  #3. Make polygons
+  cp.poly<-polyfun(cp.list2)
+  #4. Make raster
+  r<-raster()
+  extent(r) = c(-67, -58, 44, 51)
+  ##half minute grids
+  res(r)<-1/120
+  r2 <- rasterize(cp.poly, r, fun='count')
+  #plot(r2)
+  r_spdf <- as(r2, "SpatialPixelsDataFrame")
+  r_df <- as.data.frame(r_spdf)
+  colnames(r_df) <- c("value", "x", "y")
+  r_df$value<-as.factor(r_df$value)
+  r_df
+} 
+
+#######
+# two analyses here:
+# 1. where id of individual is considered
+# 2. where all sightings are considered together
+library(purrr)
+##Unique EGNo
+cp.df_res_id_list<-lapply(GSLdem_notdead_spdf_year, cp.df90id)
+r_df_res_id_list<-lapply(cp.df_res_id_list, r_df)
+
+##SAME/together
+cp.df_res_sa_list<-lapply(GSLdem_notdead_same_year, cp.df90)
+
+## Collapse lists
+
+typeyear<-lapply(cp.df_res_id_list,function(x){dplyr::bind_rows(x, .id = "Type")})
+typeyear_all<-dplyr::bind_rows(typeyear, .id = "SightingYear")
+cp.df_res_id<-typeyear_all%>%filter(Type == "union")
+
+r_df_res_id<-dplyr::bind_rows(r_df_res_id_list, .id = "SightingYear")
+r_df_res_id$value<-as.numeric(r_df_res_id$value)
+
+cp.df_res_sa<-dplyr::bind_rows(cp.df_res_sa_list, .id = "SightingYear")
+
+##########
+## Maps ##
+##########
+
+basemap<-ggplot()+
+  geom_polygon(GSL_provinces, mapping = aes(long,lat,group = group), fill = "antiquewhite", color = "grey50", size = 0.25)+
+  geom_polygon(USeast, mapping = aes(long,lat,group = group), fill = "antiquewhite", color = "grey50", size = 0)+
+  geom_path(fortify(iso200), mapping = aes(long,lat,group = group), color = "steelblue", alpha = 0.7, size = 0.5)+
+  geom_path(data = fortify(ship.sp), aes(x = long, y = lat, group = group), color = "peachpuff4", size = 0.5)+
+  geom_polygon(data = tss_polygons, aes(x = lon, y = lat), fill = "peachpuff4", color = "peachpuff4", size = 0.5, alpha = 0.5)+
+  coord_sf(xlim = c(-70,-57), ylim = c(45.5,51.5), crs = 4269)+
+  theme_bw()+
+  theme(text = element_text(size = 11),
+        axis.text.x = element_text(size = 11),
+        axis.text.y = element_text(size = 11),
+        strip.text.x = element_text(size = 11))+
+  ylab("Latitude")
+
+basemap2<-basemap+
+  geom_path(fortify(iso50), mapping = aes(long,lat,group = group), color = "steelblue2", alpha = 0.7, size = 0.25)+
+  geom_path(fortify(iso100), mapping = aes(long,lat,group = group), color = "steelblue2", alpha = 0.7)+
+  geom_path(data = fortify(ship.sp), aes(x = long, y = lat, group = group), color = "peachpuff4", size = 0.5)+
+  geom_polygon(data = tss_polygons, aes(x = lon, y = lat), fill = "peachpuff4", color = "peachpuff4", size = 0.5, alpha = 0.5)
+
+########
+
+cap_colors = c("< 5 days" = wes_palette("Darjeeling1")[1], "5+ days" = wes_palette("Darjeeling1")[2], "No ID" = "black")
+
+#mcp map 1
+indi90<-basemap2+
+  coord_sf(xlim = c(-65.4,-59.0), ylim = c(46.0,50.5), crs = 4269)+
+  geom_point(ph_noid, mapping = aes(Longitude,Latitude, color = "No ID"), size = 1)+
+  geom_point(GSLdem_notdead_4, mapping = aes(Longitude,Latitude, color = "< 5 days"), size = 1)+
+  geom_point(GSLdem_notdead_5, mapping = aes(Longitude,Latitude, color = "5+ days"), size = 1)+
+  geom_polygon(cp.df_res_id,mapping = aes(long,lat,group = group), fill = "grey30", alpha = 0.5)+
+  geom_polygon(cp.df_res_sa, mapping = aes(long,lat,group = group), color = "black", alpha = 0)+
+  facet_wrap(~SightingYear, nrow = 1)+
+  scale_color_manual(values=cap_colors, 
+                     name="Days IDed")+
+    theme(axis.text.x=element_blank(),
+          legend.position = c(0.937,0.837),
+          legend.title=element_text(size=7), 
+          legend.text = element_text(size=7),
+          legend.background=element_rect(color = "black", fill = alpha("white", 0.9)),
+          legend.key.size = unit(0.17, "cm"),
+          axis.text.y = element_text(size = 7))+
+  xlab("")
+
+############
+## raster category
+##for categorizing overlap
+
+r_df_res_id_10<-r_df_res_id%>%
+  mutate(Polygons = as.factor(value))%>%
+  mutate(Polygons=replace(Polygons, Polygons != 1 & Polygons != 2 & Polygons != 3 & Polygons != 4 & Polygons != 5 & Polygons != 6 & Polygons != 7 & Polygons != 8 & Polygons != 9, 10))
+
+r_df_res_id_10$Polygons<-factor(r_df_res_id_10$Polygons, levels = c(1,2,3,4,5,6,7,8,9,10), labels = "AUTO")
+
+#mcp map 2
+## raster
+rastmap<-basemap2+
+  coord_sf(xlim = c(-65.4,-59.0), ylim = c(46.0,50.5), crs = 4269)+
+  geom_tile(data=r_df_res_id_10, aes(x=x, y=y, fill=Polygons), stat = "identity")+
+  facet_wrap(~SightingYear, nrow = 1)+
+  theme(legend.position = c(0.945,0.66),
+        legend.background=element_rect(color = "black", fill = alpha("white", 0.9)),
+        legend.title=element_text(size=7),
+        legend.text = element_text(size=7),
+        legend.key.size = unit(0.17, "cm"),
+        axis.text.x = element_text(size = 7),# angle = 45, vjust = 1, hjust= 1),
+        axis.text.y = element_text(size = 7))+
+  scale_fill_viridis_d(alpha = 1, begin = 0, end = 1,
+                      direction = 1, option = "D", aesthetics = "fill", labels = c(1,2,3,4,5,6,7,8,9,"10+"))+
+  xlab("Longitude")
+
+
+#####
+fig6<-ggpubr::ggarrange(indi90,rastmap,labels = "AUTO", nrow = 2, align = "hv")
+ggsave(filename = 'Fig6.svg',fig6,device = 'svg', './Figures', width = 169, height = 150, units = "mm", dpi = 320)
+```
+```{r Monthly_maps, echo = FALSE, warning = FALSE, message = FALSE, results = 'asis'}
+
+####################
+## monthly ##
+####################
+
+GSLdem_notdead_move$EGNO<-as.factor(GSLdem_notdead_move$EGNO)
+GSLdem_notdead_move$SightingYear<-as.factor(GSLdem_notdead_move$SightingYear)
+
+noid$EGNO<-as.factor(noid$EGNO)
+noid$SightingYear<-as.factor(noid$SightingYear)
+
+allGSLdem_notdead<-GSLdem_notdead_move%>%
+  bind_rows(noid)%>%  
+  group_by(SightingMonth)%>%
+  arrange(SightingMonth)%>%
+  mutate(monthabb = case_when(
+    SightingMonth == 5 ~ 'May',
+    SightingMonth == 6 ~ 'June',
+    SightingMonth == 7 ~ 'July',
+    SightingMonth == 8 ~ 'August',
+    SightingMonth == 9 ~ 'September',
+    SightingMonth == 10 ~ 'October',
+    SightingMonth == 11 ~ 'November',
+    SightingMonth == 12 ~ 'December'))%>%
+  mutate(numberdays = paste0(monthabb,", days = ", days_per_month))
+
+newlabelsdf<-allGSLdem_notdead%>%ungroup()%>%filter(!is.na(days_per_month))%>%distinct(numberdays)
+newlabels<-newlabelsdf$numberdays
+
+monthlymove_GSLdem<-allGSLdem_notdead%>%
+  filter(pos == 'A')%>%
+  filter(EGNO != '' & EGNO != 'UNMA')
+
+monthlymove_GSLdem$numberdays<-factor(monthlymove_GSLdem$numberdays, levels = newlabels)
+
+morast<-allGSLdem_notdead%>%
+  dplyr::select(SightingMonth, Latitude, Longitude)%>%
+  dplyr::rename("id" = "SightingMonth", "lat" = "Latitude", "long" = "Longitude")
+
+morast$id<-as.numeric(morast$id)
+
+  cp.df.ls<-morast%>%dplyr::select(id,long,lat)%>%ungroup()
+  cp.list<-split(cp.df.ls, cp.df.ls$id)
+  cp.list2<-lapply(cp.list, function(x){x%>%dplyr::select(-id)})
+
+  coord<-lapply(cp.list2, function(x){SpatialPoints(x, proj4string = CRS.latlon)})
+
+  ##change projection
+  coord_proj.sp<-lapply(coord, function(x){spTransform(x, CRS.R)})
+  #Make raster
+  r<-raster()
+  extent(r) = c(-70, -57, 45, 52)
+  ##10 minute grids like the fishing grid (10min/60min = 1/6)
+  res(r)<-1/6
+  r2 <- lapply(coord_proj.sp, function(x){rasterize(x, r, fun='count')})
+  r_spdf <- lapply(r2, function(x){as(x, "SpatialPixelsDataFrame")})
+  r_df <- lapply(r_spdf, function(x){as.data.frame(x)})
+  r_df<-bind_rows(r_df, .id = "column_label")
+  colnames(r_df) <- c("Month_order","value", "x", "y")
+  r_df$Month_order<-as.numeric(r_df$Month_order)
+  
+  r_df<-newlabelsdf%>%
+    mutate(Month_order = 5:12)%>%
+    right_join(r_df, by = c('Month_order'))
+
+  r_df_100<-r_df%>%
+  mutate(value=replace(value, value >= 100, 100))
+  
+  r_df_100$numberdays<-factor(r_df_100$numberdays, levels = newlabels)
+
+monthly_heatmap<-ggplot()+
+      annotation_map(map_data("world"), fill = "antiquewhite", color = "grey50", size = 0.1)+
+      annotation_map(map_data("state"), fill = "antiquewhite", color = "grey50", size = 0.1)+
+      geom_path(fortify(iso200), mapping = aes(long,lat,group = group), color = "steelblue", alpha = 0.7, size = 0.25)+
+      geom_path(data = fortify(ship.sp), aes(x = long, y = lat, group = group), color = "peachpuff4", size = 0.1)+
+      geom_polygon(data = tss_polygons, aes(x = lon, y = lat), fill = "peachpuff4", color = "peachpuff4", size = 0.1, alpha = 0.5)+
+      coord_sf(xlim = c(-70,-59), ylim = c(45.0,51.0), crs = 4269)+    
+  theme_bw()+
+    geom_path(data = monthlymove_GSLdem, mapping = aes(x = Longitude, y = Latitude, group = interaction(as.character(SightingYear),EGNO)), color = "red", size = 0.5, alpha = 0.6)+
+  geom_tile(data=r_df_100, aes(x=x, y=y, fill=value), stat = "identity")+
+  facet_wrap(~numberdays)+
+  scale_fill_viridis_c(alpha = 1, begin = 0, end = 1,direction = 1, option = "D", aesthetics = "fill", breaks = c(25,50,75,100),labels = c(25,50,75,"100+"), "# whales photographed")+
+  xlab("Longitude")+
+  ylab("Latitude")+
+  theme(legend.position = c(0.85,0.15),
+        text = element_text(size = 11),
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7),
+        strip.text.x = element_text(size = 11),
+        legend.key.size = unit(0.5, "cm"))
+
+monthly_heatmap<-ggpubr::ggarrange(monthly_heatmap,labels = "A")
+ggsave(filename = 'Fig7A.svg',monthly_heatmap,device = 'svg', './Figures', width = 169, height = 160, units = "mm", dpi = 320)
+
+```
+```{r NS, echo = FALSE, warning = FALSE, message = FALSE, results = 'asis'}
+###############
+## Anticosti ##
+###############
+
+#whales sighted in the northern GSL
+
+eg49<-GSLdem%>%
+  filter((Latitude >= 49 | Longitude < -66) & !grepl('DEAD',Behaviors))
+
+egno_49<-eg49%>%
+  filter(pos == 'A')%>%
+  distinct(EGNO, SightingYear)%>%
+  arrange(SightingYear,EGNO)
+
+###############
+#whales sighted in the southern GSL
+egsgsl<-GSLdem%>%
+  filter(pos == 'A')%>%
+  filter(Latitude < 49 & Longitude > -66 & Latitude > 0)
+
+egno_sgsl<-egsgsl%>%
+  distinct(EGNO,SightingYear)
+
+##animals between northern and southern gulf
+NSG<-egno_49%>%
+  inner_join(egno_sgsl, by = c("EGNO","SightingYear"))%>%
+  inner_join(GSLdem)%>%
+  arrange(EGNO, Date)%>%
+  mutate(YearEGNO = paste0(SightingYear,"-",EGNO),
+         EGNO_AS = paste0(EGNO," - ", AgeClass,Sex),
+         NS = case_when(
+           Latitude >= 49 | Longitude < -66 ~ 'N',
+           Latitude < 49 ~ 'S'
+         ))
+
+NSG_demo<-NSG%>%
+  distinct(EGNO,SightingYear,Sex,AgeClass)%>%
+  pivot_wider(names_from = SightingYear, values_from = AgeClass)
+
+NSG$SightingMonth<-as.factor(NSG$SightingMonth)
+NSG$YearEGNO<-as.factor(NSG$YearEGNO)
+NSG$NS<-factor(NSG$NS, levels = c('S','N'))
+
+allNSG<-NSG%>%
+  mutate(EGNO = 'All',
+         EGNO_AS = 'ALL')
+
+NSG_all<-NSG%>%
+  bind_rows(allNSG)
+
+NSG_all$SightingYear<-as.factor(NSG_all$SightingYear)
+
+NSplot<-ggplot(NSG_all)+
+  geom_point(mapping = aes(x=yday(Date), y = NS, color = SightingYear), size = 2, alpha = 0.8)+
+  geom_line(mapping = aes(x=yday(Date), y = NS, group = YearEGNO, color = SightingYear), size = 1, alpha = 0.8)+
+  geom_point(data = NSG_all%>%filter(SightingYear == 2019), mapping = aes(x=yday(Date), y = NS), color = "gold2", size = 2, alpha = 0.7, shape = 1)+
+  geom_point(data = NSG%>%filter(SightingYear == 2019), mapping = aes(x=yday(Date), y = NS), color = "gold2", size = 2, alpha = 0.7, shape = 1)+
+  geom_rect(mapping = aes(xmin=181,xmax=288),ymin='N',ymax='S', colour="black", size=0.5, alpha=0)+
+  facet_wrap(~EGNO_AS, ncol = 2)+
+  scale_colour_viridis_d(option = "plasma", name = '')+
+  theme_bw()+
+  scale_x_continuous(breaks = c(121,152,182,213,244,274,305), labels = c("May","June","July","Aug","Sep","Oct","Nov"), limits = c(121,305))+
+  ylab("Region")+
+  xlab("Month")+
+  theme(panel.grid.minor = element_blank(),
+        legend.position = c(0.8,0.06),
+        legend.title=element_blank(),
+        legend.margin = margin(c(0.5,1,1,1)),
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 8),
+        strip.text.x = element_text(size = 8),
+        legend.key.size = unit(0.4, "cm"))
+
+NSplot<-ggpubr::ggarrange(NSplot,labels = "B")
+ggsave(filename = 'Fig7B.svg',NSplot,device = 'svg', './Figures', width = 81, height = 150, units = "mm", dpi = 320)
+```
+
+# Tables
+\captionsetup{width=6.5in}
+```{r tables, echo = FALSE, message=FALSE, warning=FALSE}
+## TABLE ##
+options(knitr.kable.NA = '')
+options(knitr.table.format = "latex")
+#######
+tab1<-tab1%>%
+  mutate(Last = case_when(
+    Last == '05 Dec' & Dataset == 'All data' ~ '05 Dec$^a$', #2017
+    Last == '31 Oct' & Dataset == 'All data' ~ '31 Oct$^b$', #2018
+    TRUE ~ Last))
+
+table1<-kable(tab1, "latex", booktabs = T, linesep = "", escape = F, caption = "Details on the sighting period and overall number of photographed sightings and individuals observed in the Gulf of St. Lawrence each year from 2015 to 2019. Additionally, the numbers of cows sighted in the GSL in each year are provided, including: those with calves (out of the total known for the species each year), those subsequently known to have been pregnant, and those resting (life stage between having a dependent calf and being pregnant).")%>%
+  kable_styling(latex_options = c("HOLD_position"), full_width = F) %>%
+  add_header_above(c(" " = 6, "Cows" = 3), escape = F)%>%
+  group_rows("2015",1,2,italic = F, escape = F)%>%
+  group_rows("2016",3,3,italic = F, escape = F)%>%
+  group_rows("2017",4,5,italic = F, escape = F)%>%
+  group_rows("2018",6,7,italic = F, escape = F)%>%
+  group_rows("2019",8,9,italic = F, escape = F)%>%
+  footnote(alphabet_title = "\\\\small{Unphotographed sightings outside of 'All data' timeframe listed above:}",
+         alphabet = c("\\\\small{2017: three right whales sighted on 12 Dec}",
+                      "\\\\small{2018: three and two right whales sighted on 01 and 05 Nov, respectively}"),
+         escape = F)
+
+#######
+table2<-kable(demotable_all, "latex", booktabs = T, linesep = "", caption = "The age-sex structure of the animals sighted within ’All data’ each year, including the number and proportions of sex and age classes presumed alive within the North Atlantic Right Whale Catalog at the end of 2019. Age classes are defined as A = adult, J = juvenile, U = unknown, and C = calf, and sex includes M = male, F = female, and X = unknown.",  col.names = c("Age class","M","F","X")) %>%
+  kable_styling(full_width = F, latex_options = "HOLD_position") %>%
+  group_rows(paste0("2015: n = ", gidperyear$count[1]), 1, 4, italic = F) %>%
+  group_rows(paste0("2016: n = ", gidperyear$count[2]), 5, 8, italic = F) %>%
+  group_rows(paste0("2017: n = ", gidperyear$count[3]), 9, 11, italic = F) %>%
+  group_rows(paste0("2018: n = ", gidperyear$count[4]), 12, 14, italic = F) %>%
+  group_rows(paste0("2019: n = ", gidperyear$count[5]), 15, 18, italic = F) %>%
+  group_rows(paste("Catalog 2019: 458"), 19, 21, italic = F)
+
+```
+\newpage
+
+<!-- $$\\[0.1in]$$ -->
+
+```{r tables2, echo = FALSE, message=FALSE, warning=FALSE}
+#######
+
+table3<-kable(Jstable_AICc, "latex", booktabs = T, linesep = "", escape = F, caption = "Model performance for each year/dataset combination in years with more dedicated survey effort (2017-2019) as well as across all years of this study (2015–2019). ’All data\\textsubscript{\\textit{s}}’ refers to the sample of ’All data’ capture histories that occurred during the mark-recapture aerial survey (MRAS) sampling periods. Within each year/dataset combination, the number of parameters (npar), the corrected Akaike information criteria (AIC\\textsubscript{\\textit{c}}), the difference between the (AIC\\textsubscript{\\textit{c}}) value and that of the model with the lowest ($\\Delta$AIC\\textsubscript{\\textit{c}}), the corrected model weight (weight\\textsubscript{\\textit{c}}), and the relative model likelihood are provided. Models are ordered by $\\Delta$AIC\\textsubscript{\\textit{c}}. \\textit{$\\phi$} = survival probability, \\textit{p} = capture probability, \\textit{pent} = entry probability, (\\textit{\\textsubscript{t}}) = time-varying, (.) = time constant.", 
+      col.names = c("Dataset","Model","npar","AIC\\textsubscript{\\textit{c}}","$\\Delta$AIC\\textsubscript{\\textit{c}}","weight\\textsubscript{\\textit{c}}","Relative\nlikelihood"), longtable = T)%>%
+  kable_styling(latex_options = c("HOLD_position", "repeat_header", "striped"))%>%
+   group_rows("2017", 1, 8, escape = F, italic = F) %>%
+   group_rows("2018", 9, 16, escape = F, italic = F) %>%
+   group_rows("2019", 17, 24, escape = F, italic = F) %>%
+   group_rows("Across years", 25, 28, escape = F, italic = F) 
+
+#######
+
+all_N_table<-all_N_table%>%
+  mutate(`Date Range` = case_when(Dataset == 'All data' ~ "", TRUE ~ `Date Range`), 
+         Dataset = case_when(Dataset == 'All data' ~ 'All data$_{s}$', TRUE ~ Dataset))%>%
+  bind_rows(alldata_yrs)%>%
+  dplyr::select(-Model)
+
+table4<-kable(all_N_table, "latex", booktabs = T, linesep = "", escape = F, caption = "The number of individuals observed and the estimated number undetected both within years when more dedicated photo-identification effort occurred (2017–2019), as well as across all years of this study (2015–2019). Within years, estimates were made within two datasets: the mark-recapture aerial surveys (MRAS) dataset and the sample of ’All data’ capture histories that occurred during the MRAS sampling period (’All data\\textsubscript{\\textit{s}}’). The number of animals observed within ’All data\\textsubscript{\\textit{s}}’ from all efforts excluding the MRAS are in parentheses to give context to the number of individuals captured from these other efforts.", 
+      col.names = c("Date Range", "Dataset", "Sampling\n Days", "Observed","Est","SE","95\\% CI","Est","95\\% CI"))%>%
+    kable_styling(latex_options = c("HOLD_position"), full_width = F) %>%
+    add_header_above(c(" " = 4, "Number undetected" = 3, "Abundance" = 2), escape = F)%>%
+    group_rows("$\\\\text{2017}\\\\textsuperscript{a}$", 1, 2, escape = F, italic = F) %>%
+    group_rows("$\\\\text{2018}\\\\textsuperscript{b}$", 3, 4, escape = F, italic = F) %>%
+    group_rows("$\\\\text{2019}\\\\textsuperscript{c}$", 5, 6, escape = F, italic = F) %>%
+    group_rows("Across years", 7, 7) %>%
+    footnote(alphabet_title = "\\\\small{Blocks:}",
+           alphabet = c("\\\\small{2017: 21--30 Jun, 01--10 Jul, 11--20 Jul, 21--30 Jul}",
+                        "\\\\small{2018: 01--10 Jun, 11--20 Jun, 21--30 Jun, 01--10 Jul, 11--20 Jul, 21--30 Jul, 31 Jul--09 Aug}",
+                        "\\\\small{2019: 01--16 Jun, 09--24 Jul, 13--28 Aug, 14--29 Oct}"),
+           escape = F)
+
+```
+\newpage
+# Figures
+```{r fig1, echo=FALSE, warning=FALSE, message=FALSE,out.width="100%",fig.align='left'}
+
+knitr::include_graphics(c("./Figures/Fig1A.svg","./Figures/Fig1B.svg"))
+```
+
+Fig. 1.  
+\newpage
+```{r fig2, echo=FALSE, warning=FALSE, message=FALSE,out.width="100%",fig.align='left'}
+knitr::include_graphics("./figures/Fig2.svg")
+```
+
+Fig. 2.  
+\newpage
+```{r fig3, echo=FALSE, warning=FALSE, message=FALSE,out.width="100%",fig.align='left'}
+knitr::include_graphics("./figures/Fig3.svg")
+```
+
+Fig. 3. 
+\newpage
+```{r Fig4, echo=FALSE, warning=FALSE, message=FALSE,out.width="49%",fig.show='hold',fig.align='center', fig.width=6.65}
+knitr::include_graphics(c("./figures/Fig4A.png","./figures/Fig4B.svg"))
+```
+
+Fig. 4.  
+\newpage
+```{r fig5,  echo=FALSE,out.width="100%",fig.show='hold',fig.align='left'}
+knitr::include_graphics("./Figures/Fig5A.svg")
+knitr::include_graphics("./Figures/Fig5BC.svg")
+```
+Fig. 5.  
+
+```{r fig6, echo=FALSE, warning=FALSE, message=FALSE,out.width="100%",fig.align='left'}
+knitr::include_graphics("./figures/Fig6.svg")
+```
+
+Fig. 6. 
+\newpage
+```{r fig7, echo=FALSE, warning=FALSE, message=FALSE,out.width="100%",fig.align='left'}
+knitr::include_graphics("./Figures/Fig7A.svg")
+knitr::include_graphics("./Figures/Fig7B.svg")
+```
+
+Fig. 7.  
+\newpage
+
+```{r table_output, echo=FALSE, warning=FALSE, message=FALSE}
+table1
+table2
+table3
+table4
+```
+
+\newpage
+\setcounter{page}{1}
+\begin{center}
+Supplementary materials to accompany the article
+\end{center}
+\begin{center}\Large In plane sight: a mark-recapture analysis of North Atlantic right whales in the Gulf of St. Lawrence
+\end{center}
+\begin{center}
+Leah M. Crowe*, Moira W. Brown, Peter J. Corkeron, Philip K. Hamilton, Christian Ramp, Stephanie Ratelle, Angelia S. M. Vanderlaan, Tim V. N. Cole
+\end{center}
+\begin{center}
+*Corresponding author: leah.crowe@noaa.gov
+\end{center}
+```{r suppmat, echo = FALSE, warning = FALSE, message = FALSE}
+
+efforttl<-read.csv('./data/effort_timeline.csv', header = T, stringsAsFactors = F)
+
+efforttl<-efforttl%>%
+  mutate(first_date = ymd(paste0(Year,'-',First,'-01')),
+         last_date = ceiling_date(ymd(paste0(Year,'-',Last,'-30')), "month") - 1)%>%
+  pivot_longer(cols = c(first_date, last_date),names_to = 'span',
+               values_to = 'date')%>%
+  mutate(jday = yday(date))%>%
+  arrange(Type, date)
+
+efforttl$Type<-factor(efforttl$Type, levels = c("MWSS","SDSS","SVAS","SLAS","MRAS","BSAS"))
+myCol<-c("black","#7570b3","#d95f02","#e7298a","grey40","#1b9e77")
+sup_map_fill = c("BSAS" = myCol[1],"SDSS" = myCol[4], "MRAS" = myCol[3], "MWSS" = myCol[2],"SVAS" = myCol[5],"SLAS" = myCol[6])
+
+eff_tl<-ggplot(efforttl)+
+  geom_line(efforttl%>%filter(!(Type == 'MRAS' & Last == 'September')), mapping = aes(x = jday, y = Type, group = Type, color = Type), size = 3, alpha = 0.8)+
+  geom_line(efforttl%>%filter(Type == 'MRAS' & Last == 'September'), mapping = aes(x = jday, y = Type, group = Type), color = 'white', size = 3)+
+  facet_grid(~Year)+
+  scale_x_continuous(breaks = c(91,121,152,182,213,244,274,305,335,365), labels = c("Apr","May","June","July","Aug","Sep","Oct","Nov","Dec","Jan (next year)"))+
+  theme_bw()+
+  ylab('Survey Type')+
+  xlab('')+
+  theme(panel.grid.minor = element_blank(),
+        legend.title=element_blank(),
+        legend.position = 'none',
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  scale_fill_manual(values = sup_map_fill)+
+  scale_color_manual(values = sup_map_fill)
+
+FigS1B<-ggpubr::ggarrange(eff_tl,labels = "B")
+ggsave(filename = 'FigS1B.svg',FigS1B,device = 'svg', './Figures', width = 169, height = 60, units = "mm", dpi = 320)
+
+######
+#MRAS
+suppmap_MRAS<-read.csv('./data/MRAS supp map.csv', header = T, stringsAsFactors = F)
+suppmap_MRAS$DATETIME_ET<-ymd_hms(suppmap_MRAS$DATETIME_ET)
+
+suppmap_MRAS<-suppmap_MRAS%>%
+  mutate(date = as.factor(substr(DATETIME_ET, 1,10)),
+         MONTH = as.numeric(month(DATETIME_ET)))%>%
+  arrange(DATETIME_ET)
+
+#####
+#MWSS (NEA/CWI)
+
+suppmap_MWSS15<-read.csv('./data/NEA2015.csv', header = T, stringsAsFactors = F)%>%mutate(date = ymd(paste0(YEAR,'-',MONTH,'-', DAY)))%>%dplyr::select(date, YEAR, EVENTNO, LATITUDE, LONGITUDE, PLATNAME, MONTH)
+suppmap_MWSS16<-read.csv('./data/NEA2016.csv', header = T, stringsAsFactors = F)%>%mutate(date = ymd(paste0(YEAR,'-',MONTH,'-', DAY)))%>%dplyr::select(date, YEAR, EVENTNO, LATITUDE, LONGITUDE, PLATNAME, MONTH)
+suppmap_MWSS17<-read.csv('./data/NEA2017.csv', header = T, stringsAsFactors = F)%>%mutate(date = ymd(paste0(YEAR,'-',MONTH,'-', DAY)))%>%dplyr::select(date, YEAR, EVENTNO, LATITUDE, LONGITUDE, PLATNAME, MONTH)
+suppmap_MWSS18<-read.csv('./data/NEA2018.csv', header = T, stringsAsFactors = F)%>%mutate(date = ymd(paste0(YEAR,'-',MONTH,'-', DAY)))%>%dplyr::select(date, YEAR, EVENTNO, LATITUDE, LONGITUDE, PLATNAME, MONTH)
+suppmap_MWSS19<-read.csv('./data/NEA2019.csv', header = T, stringsAsFactors = F)%>%mutate(date = ymd(paste0(YEAR,'-',MONTH,'-', DAY)))%>%dplyr::select(date, YEAR, EVENTNO, LATITUDE, LONGITUDE, PLATNAME, MONTH)
+
+suppmap_MWSS<-suppmap_MWSS15%>%
+  bind_rows(suppmap_MWSS16)%>%
+  bind_rows(suppmap_MWSS17)%>%
+  bind_rows(suppmap_MWSS18)%>%
+  bind_rows(suppmap_MWSS19)%>%
+  filter(!is.na(YEAR))%>%
+  filter(LATITUDE > 46)%>%
+  mutate(platdate = paste0(PLATNAME,date),
+         MONTH = as.numeric(MONTH))
+#####
+#SDSS
+suppmap_SDSS<-data.frame(LATITUDE = c(49.656, 50.432, 50.432, 49.834), 
+                         LONGITUDE = c(-62.884, -62.884, -65.011, -65.011))
+##
+
+dynaship<-readOGR("./shapefiles", layer = "Dynamic_Shipping_Section", verbose = FALSE)
+dynaship.tr<-spTransform(dynaship, CRS.new)
+dynaship.sp<-spTransform(dynaship.tr,CRS.latlon)
+
+to_string <- as_labeller(c(`4` = "April", `5` = "May", `6` = "June", `7` = "July", `8` = "August", `9` = "September", `10` = "October", `11` = "November"))
+
+sup_map<-ggplot()+
+  annotation_map(map_data("world"), fill = "antiquewhite", color = "grey50", size = 0.1)+
+  annotation_map(map_data("state"), fill = "antiquewhite", color = "grey50", size = 0.1)+
+  geom_path(fortify(iso200), mapping = aes(long,lat,group = group), color = "steelblue", alpha = 0.7, size = 0.25)+
+  geom_path(data = fortify(ship.sp), aes(x = long, y = lat, group = group), color = "peachpuff4", size = 0.1)+
+  geom_polygon(data = tss_polygons, aes(x = lon, y = lat), fill = "peachpuff4", color = "peachpuff4", size = 0.1, alpha = 0.5)+
+  coord_sf(xlim = c(-70,-59), ylim = c(45.0,51.0), crs = 4269)+    
+  theme_bw()+
+  #MICS
+  geom_polygon(suppmap_SDSS%>%mutate(MONTH = 6), mapping = aes(x = LONGITUDE, y = LATITUDE, fill = "SDSS"),  alpha = 0.5)+
+  geom_polygon(suppmap_SDSS%>%mutate(MONTH = 7), mapping = aes(x = LONGITUDE, y = LATITUDE, fill = "SDSS"),  alpha = 0.5)+
+  geom_polygon(suppmap_SDSS%>%mutate(MONTH = 8), mapping = aes(x = LONGITUDE, y = LATITUDE, fill = "SDSS"),  alpha = 0.5)+
+  geom_polygon(suppmap_SDSS%>%mutate(MONTH = 9), mapping = aes(x = LONGITUDE, y = LATITUDE, fill = "SDSS"),  alpha = 0.5)+
+  #Provinces
+  geom_polygon(GSL_provinces, mapping = aes(long,lat,group = group), fill = "antiquewhite", color = "grey50", size = 0.25)+
+  #Shipping lane 2018
+  geom_polygon(data = fortify(dynaship.sp)%>%filter(id != 4)%>%mutate(YEAR = 2018, MONTH = 4), aes(x = long, y = lat, group = group, fill = "SLAS"), size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%filter(id != 4)%>%mutate(YEAR = 2018, MONTH = 5), aes(x = long, y = lat, group = group, fill = "SLAS"), size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%filter(id != 4)%>%mutate(YEAR = 2018, MONTH = 6), aes(x = long, y = lat, group = group, fill = "SLAS"), size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%filter(id != 4)%>%mutate(YEAR = 2018, MONTH = 7), aes(x = long, y = lat, group = group, fill = "SLAS"), size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%filter(id != 4)%>%mutate(YEAR = 2018, MONTH = 8), aes(x = long, y = lat, group = group, fill = "SLAS"), size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%filter(id != 4)%>%mutate(YEAR = 2018, MONTH = 9), aes(x = long, y = lat, group = group, fill = "SLAS"), size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%filter(id != 4)%>%mutate(YEAR = 2018, MONTH = 10), aes(x = long, y = lat, group = group, fill = "SLAS"), size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%filter(id != 4)%>%mutate(YEAR = 2018, MONTH = 11), aes(x = long, y = lat, group = group, fill = "SLAS"), size = 0.25, alpha = 0.5)+
+  #Shipping lane 2019
+  geom_polygon(data = fortify(dynaship.sp)%>%mutate(YEAR = 2019, MONTH = 5), aes(x = long, y = lat, group = group, fill = "SLAS"),  size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%mutate(YEAR = 2019, MONTH = 6), aes(x = long, y = lat, group = group, fill = "SLAS"),  size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%mutate(YEAR = 2019, MONTH = 7), aes(x = long, y = lat, group = group, fill = "SLAS"),  size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%mutate(YEAR = 2019, MONTH = 8), aes(x = long, y = lat, group = group, fill = "SLAS"),  size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%mutate(YEAR = 2019, MONTH = 9), aes(x = long, y = lat, group = group, fill = "SLAS"),  size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%mutate(YEAR = 2019, MONTH = 10), aes(x = long, y = lat, group = group, fill = "SLAS"),  size = 0.25, alpha = 0.5)+
+  geom_polygon(data = fortify(dynaship.sp)%>%mutate(YEAR = 2019, MONTH = 11), aes(x = long, y = lat, group = group, fill = "SLAS"),  size = 0.25, alpha = 0.5)+
+  #TWIN OTTER
+  geom_path(suppmap_MRAS, mapping = aes(x = LONGITUDE, y = LATITUDE, group = date, color = "MRAS"), size = 0.25)+
+  #NEAQ/CWI
+  geom_path(suppmap_MWSS, mapping = aes(x = LONGITUDE, y = LATITUDE, group = platdate, color = "MWSS"), size = 0.25)+
+  facet_wrap(~MONTH, ncol = 3, labeller = to_string)+
+  ylab("Latitude")+
+  xlab("Longitude")+
+  theme(legend.position = c(0.85,0.15),
+        text = element_text(size = 11),
+        legend.title = element_blank(),
+        legend.text=element_text(size=11),
+        legend.key.size = unit(0.7, "line"),
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7))+
+  coord_sf(xlim = c(-70,-57), ylim = c(45.5,51.5), crs = 4269)+
+  scale_fill_manual(values = sup_map_fill)+
+  scale_color_manual(values = sup_map_fill, guide = F)
+
+figS1A<-ggpubr::ggarrange(sup_map,labels = "A")  
+ggsave(filename = 'FigS1A.svg',figS1A,device = 'svg', './Figures', width = 169, height = 160, units = "mm", dpi = 320)
+ggsave(filename = 'FigS1A.png',figS1A,device = 'png', './Figures', width = 169, height = 160, units = "mm", dpi = 320)
+
+```
+
+```{r suppfig1, echo=FALSE, warning=FALSE, message=FALSE,out.width="100%",fig.align='left'}
+knitr::include_graphics("./Figures/FigS1A.svg")
+knitr::include_graphics("./Figures/FigS1B.svg")
+```
+Fig. S1.
+
+Effort details for the different dedicated right whale survey efforts in the GSL that contributed photo data to this study, 2015–2019. Aerial surveys included broad-scale (BSAS), mark-recapture (MRAS), surveillance in the shipping lanes and corridor (SLAS), and surveillance throughout the entire GSL (SVAS). Shipboard surveys included single-day shipboard surveys (SDSS), and multi-week shipboard surveys (MWSS). The 2019 data used in this study only includes data from BSAS, SVAS and SLAS that occurred before June, in September, and after October.
+
+A) Available monthly effort details including all trackline data for MRAS, trackline data for the MWSS efforts included in this study, and general target areas for SDSS and SLAS efforts. For effort details on BSAS and SVAS efforts, see DFO (2020) and Johnson (2018).
+
+B) Yearly timelines indicating the months when the different dedicated surveys occurred.
+
+\newpage
+```{r suppfig2, echo=FALSE, warning=FALSE, message=FALSE,out.width="100%",fig.align='left', height = 6}
+
+source('./script/suppmat/suppfig2.R', local = TRUE)$value
+
+```
+Fig. S2. Model averaged estimates of survival probability across all years (2015–2019). 
+
+\newpage
+Appendix I. Goodness of fit results for each dataset used to estimate abundance.
+```{r GOF, echo=T, warning=FALSE, message=FALSE}
+
+library(R2ucare)
+
+GOF_CJS<-function(x){
+  
+  n<-as.matrix(x[1])
+  n[n==0]<-1
+  
+  overall_gof<-overall_CJS(as.matrix(x), n)
+  trap<-test2ct(as.matrix(x), n) # test of trap dependence 
+  trans<-test3sr(as.matrix(x), n) # test of transience
+  # tests of over-dispersion
+  od1<-test2cl(as.matrix(x), n)  
+  od2<-test3sm(as.matrix(x), n) 
+  
+  list(overall_gof=overall_gof,trap=trap,trans=trans,od1=od1,od2=od2)
+}
+
+#MRAS 2017
+GOF_CJS(ch.MRAS17)
+
+#MRAS 2018
+GOF_CJS(ch.MRAS18)
+
+#MRAS 2019
+GOF_CJS(ch.MRAS19)
+
+#All data 2017
+GOF_CJS(ch.alldata_s17)
+
+#All data 2018
+GOF_CJS(ch.alldata_s18)
+
+#All data 2019
+GOF_CJS(ch.alldata_s19)
+
+#All years
+GOF_CJS(ch.allyears)
+
+```
+
+\newpage
+Literature cited
+
+DFO (Department of Fisheries and Oceans) (2020) Updated information on the distribution of North Atlantic Right Whale in Canadian waters. DFO Can Sci Advis Sec Sci Advis Rep 2020/037.
+
+Gimenez O, Lebreton J-D, Choquet R, Pradel R (2018) R2ucare: An r package to perform goodness-of-fit tests for capture–recapture models. Methods Ecol Evol 9:1749–1754. doi: 10.1111/2041-210X.13014
+
+Johnson HD (2018) WhaleMap. https://whalemap.ocean.dal.ca/. [date accessed: 2020-11-25].
