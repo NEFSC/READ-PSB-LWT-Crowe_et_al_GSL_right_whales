@@ -1,6 +1,6 @@
 ### This repo accompanies the following publication:
 
-Crowe LM, Brown M, Corkeron PJ, Hamilton PK, Ramp C, Ratelle S, Vanderlaan ASM, Cole TVN (2021) In plane sight: a mark-recapture analysis of North Atlantic right whales in the Gulf of St. Lawrence. Endangered Species Research. https://doi.org/10.3354/esr01156
+Crowe LM, Brown M, Corkeron PJ, Hamilton PK, Ramp C, Ratelle S, Vanderlaan ASM, Cole TVN (2021) In plane sight: a mark-recapture analysis of North Atlantic right whales in the Gulf of St. Lawrence. Endangered Species Research 46:227-251. https://doi.org/10.3354/esr01156
 # 
 
 ABSTRACT:
